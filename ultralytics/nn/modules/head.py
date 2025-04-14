@@ -14,8 +14,86 @@ from .block import DFL, BNContrastiveHead, ContrastiveHead, Proto
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
-
+import torch.nn.functional as F
 __all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
+
+'''
+OG Class
+
+'''
+# class QExtractReal(nn.Module):
+#     """
+#     Efficiently projects quaternion features to standard format without 4x channel expansion
+#     """
+#     def __init__(self, in_channels, out_channels=None):
+#         super().__init__()
+#         # Learnable weights for quaternion components with slight initial bias toward real part
+#         self.weights = nn.Parameter(torch.tensor([1.5, 0.7, 0.7, 0.7]))
+#         # Optional projection to different channel dimension
+#         self.output_proj = nn.Conv2d(in_channels, out_channels, 1)
+#         self.bias = self.output_proj.bias
+
+#     def forward(self, x):
+#         # x shape: [B, C, 4, H, W]
+#         B, C, Q, H, W = x.shape
+#         assert Q == 4, "Expected quaternion input with 4 components"
+        
+#         # Create normalized weights for quaternion components
+#         weights = F.softmax(self.weights, dim=0).view(1, 1, 4, 1, 1)
+        
+#         # Weighted projection along quaternion dimension - much more efficient than concatenation
+#         projected = (x * weights).sum(dim=2)  # Shape: [B, C, H, W]
+        
+#         # Optional channel projection
+
+#         return self.output_proj(projected)
+
+'''
+Learnable Class
+'''
+
+class QER(nn.Module):
+    def __init__(self, in_channels, out_channels=None):
+        super().__init__()
+        # Initialize with bias toward real component
+        self.weights = nn.Parameter(torch.tensor([1.5, 0.8, 0.8, 0.8]))
+        # The 1x1 conv will handle channel transformations
+        self.output_proj = nn.Conv2d(in_channels, out_channels, 1)
+        # Register a buffer for target weights - not used in computation but accessible
+        self.register_buffer('target_weights', torch.tensor([1.5, 0.8, 0.8, 0.8]))
+        self.bias = self.output_proj.bias
+        self.act = nn.SiLU()
+        self.bn = nn.BatchNorm2d(out_channels)
+    def forward(self, x):
+        B, C, Q, H, W = x.shape
+        # Normalize weights for weighted sum
+        weights = F.softmax(self.weights, dim=0).view(1, 1, 4, 1, 1)
+        # Weighted sum across quaternion components
+        projected = (x * weights).sum(dim=2)  # Shape: [B, C, H, W]
+        return self.output_proj(projected)
+        
+        
+    def get_reg_loss(self):
+        """Return regularization loss term to add to main loss"""
+        return 0.01 * F.mse_loss(self.weights, self.target_weights)
+
+'''
+Real Projection Class
+'''
+# class QExtractReal(nn.Module):
+#     """Extract real component and expand channels to maintain information capacity"""
+#     def __init__(self, in_channels, out_channels=None):
+#         super().__init__()
+#         # For direct extraction, we need 4x input channels to maintain capacity
+#         expanded_channels = in_channels * 4
+#         self.output_proj = nn.Conv2d(in_channels, out_channels, 1)
+#         self.bias = self.output_proj.bias
+#     def forward(self, x):
+#         # Extract only the real component (first quaternion component)
+#         real_component = x[:, :, 0, :, :]
+        
+#         # Project to output channels (which should be 4x input channels)
+#         return self.output_proj(real_component)
 
 
 class Detect(nn.Module):
@@ -41,19 +119,20 @@ class Detect(nn.Module):
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
         self.cv2 = nn.ModuleList(
-            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+            nn.Sequential(
+                Conv(x, c2, 3),  # Using c2 for intermediate channels
+                Conv(c2, c2, 3), 
+                QER(c2//4, 4*self.reg_max),  # Extract real component and scale back
+                # nn.Conv2d(c2, 4 * self.reg_max, 1)
+            ) for x in ch
         )
-        self.cv3 = (
-            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
-            if self.legacy
-            else nn.ModuleList(
-                nn.Sequential(
-                    nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
-                    nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
-                    nn.Conv2d(c3, self.nc, 1),
-                )
-                for x in ch
-            )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(
+                nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),  # Using c3 for intermediate channels
+                nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                QER(c3//4, self.nc),  # Extract real component and scale back
+                # nn.Conv2d(c3, self.nc, 1)
+            ) for x in ch
         )
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
@@ -72,6 +151,25 @@ class Detect(nn.Module):
             return x
         y = self._inference(x)
         return y if self.export else (y, x)
+
+    # def forward(self, x):
+    #     """Concatenates and returns predicted bounding boxes and class probabilities."""
+    #     if self.end2end:
+    #         return self.forward_end2end(x)
+    #     dtype = x[0].dtype
+    #     device = x[0].device
+
+    #     for i in range(self.nl):
+    #         # Convert modules to correct dtype and device
+    #         self.cv2[i] = self.cv2[i].to(device)
+    #         self.cv3[i] = self.cv3[i].to(device)
+    #         x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1).to(device)
+
+
+    #     if self.training:  # Training path
+    #         return x
+    #     y = self._inference(x)
+    #     return y if self.export else (y, x)
 
     def forward_end2end(self, x):
         """
@@ -92,43 +190,39 @@ class Detect(nn.Module):
             x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
         if self.training:  # Training path
             return {"one2many": x, "one2one": one2one}
-
         y = self._inference(one2one)
         y = self.postprocess(y.permute(0, 2, 1), self.max_det, self.nc)
         return y if self.export else (y, {"one2many": x, "one2one": one2one})
 
     def _inference(self, x):
-        """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps."""
-        # Inference path
-        shape = x[0].shape  # BCHW
+        shape = x[0].shape
+        # print("Input shapes:", [xi.shape for xi in x])
+        # print("Input stats:", [(xi.mean().item(), xi.std().item()) for xi in x])
+        # Concatenate features
         x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
-        if self.format != "imx" and (self.dynamic or self.shape != shape):
+        # print("After cat stats:", x_cat.mean().item(), x_cat.std().item())
+        
+        # Split boxes and classes
+        box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+        # print("Pre-DFL box stats:", box.mean().item(), box.std().item())
+        
+        # DFL processing
+        dfl_box = self.dfl(box)
+        # print("Post-DFL box stats:", dfl_box.mean().item(), dfl_box.std().item())
+        
+        # Anchor processing
+        if self.dynamic or self.shape != shape:
             self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
             self.shape = shape
-
-        if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
-            box = x_cat[:, : self.reg_max * 4]
-            cls = x_cat[:, self.reg_max * 4 :]
-        else:
-            box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
-
-        if self.export and self.format in {"tflite", "edgetpu"}:
-            # Precompute normalization factor to increase numerical stability
-            # See https://github.com/ultralytics/ultralytics/issues/7371
-            grid_h = shape[2]
-            grid_w = shape[3]
-            grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=box.device).reshape(1, 4, 1)
-            norm = self.strides / (self.stride[0] * grid_size)
-            dbox = self.decode_bboxes(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2])
-        elif self.export and self.format == "imx":
-            dbox = self.decode_bboxes(
-                self.dfl(box) * self.strides, self.anchors.unsqueeze(0) * self.strides, xywh=False
-            )
-            return dbox.transpose(1, 2), cls.sigmoid().permute(0, 2, 1)
-        else:
-            dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
-
-        return torch.cat((dbox, cls.sigmoid()), 1)
+        
+        # Box decoding with checks
+        decoded_box = self.decode_bboxes(dfl_box, self.anchors.unsqueeze(0))
+        # print("Decoded box stats:", decoded_box.mean().item(), decoded_box.std().item())
+        
+        final_box = decoded_box * self.strides
+        # print("Final box stats:", final_box.mean().item(), final_box.std().item())
+        
+        return torch.cat((final_box, cls.sigmoid()), 1)
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
@@ -206,7 +300,13 @@ class OBB(Detect):
         self.ne = ne  # number of extra parameters
 
         c4 = max(ch[0] // 4, self.ne)
-        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.ne, 1)) for x in ch)
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c4, 3),
+                Conv(c4, c4, 3),
+                QExtractReal(),
+                nn.Conv2d(c4, self.ne, 1)
+                ) for x in ch)
 
     def forward(self, x):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
@@ -618,6 +718,7 @@ class v10Detect(Detect):
             nn.Sequential(
                 nn.Sequential(Conv(x, x, 3, g=x), Conv(x, c3, 1)),
                 nn.Sequential(Conv(c3, c3, 3, g=c3), Conv(c3, c3, 1)),
+                QExtractReal(),
                 nn.Conv2d(c3, self.nc, 1),
             )
             for x in ch

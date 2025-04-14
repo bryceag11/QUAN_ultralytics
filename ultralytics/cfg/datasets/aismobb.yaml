@@ -1,0 +1,7 @@
+train: aismobb/train/images
+val: aismobb/valid/images
+test: aismobb/test/images
+
+names: 
+  0: box
+  1: s

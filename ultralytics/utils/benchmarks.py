@@ -50,11 +50,11 @@ from ultralytics.utils.torch_utils import get_cpu_info, select_device
 
 def benchmark(
     model=WEIGHTS_DIR / "yolo11n.pt",
-    data=None,
-    imgsz=160,
+    data='ultralytics/cfg/datasets/aism2.yaml',
+    imgsz=640,
     half=False,
     int8=False,
-    device="cpu",
+    device="cuda",
     verbose=False,
     eps=1e-3,
     format="",

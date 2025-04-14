@@ -120,6 +120,8 @@ class BaseValidator:
             # self.model = model
             self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
+            model = model.to(dtype=next(model.parameters()).dtype)
+
             model.eval()
         else:
             if str(self.args.model).endswith(".yaml") and model is None:
@@ -135,6 +137,10 @@ class BaseValidator:
             # self.model = model
             self.device = model.device  # update device
             self.args.half = model.fp16  # update half
+            if self.args.half:
+                model = model.half()  # Convert model to FP16
+            else:
+                model = model.float()  # Or ensure FP32
             stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
             imgsz = check_imgsz(self.args.imgsz, stride=stride)
             if engine:

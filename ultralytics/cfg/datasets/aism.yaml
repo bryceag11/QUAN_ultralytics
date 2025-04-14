@@ -1,0 +1,13 @@
+train: aism/train/images
+val: aism/valid/images
+test: aism/test/images
+
+nc: 1
+names: ['box']
+
+roboflow:
+  workspace: ukyaism
+  project: aismsegmentation
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/ukyaism/aismsegmentation/dataset/1

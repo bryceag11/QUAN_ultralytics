@@ -9,12 +9,13 @@ from pathlib import Path
 
 import thop
 import torch
-
+import torch.nn as nn
 from ultralytics.nn.modules import (
     AIFI,
     C1,
     C2,
     C2PSA,
+    QC2PSA,
     C3,
     C3TR,
     ELAN1,
@@ -23,9 +24,11 @@ from ultralytics.nn.modules import (
     SPP,
     SPPELAN,
     SPPF,
+    QSPPF,
     AConv,
     ADown,
     Bottleneck,
+    QBottleneck,
     BottleneckCSP,
     C2f,
     C2fAttn,
@@ -33,12 +36,16 @@ from ultralytics.nn.modules import (
     C2fPSA,
     C3Ghost,
     C3k2,
+    QC3k2,
     C3x,
     CBFuse,
     CBLinear,
     Classify,
     Concat,
+    QConcat,
     Conv,
+    QConv,
+    QConv2D,
     Conv2,
     ConvTranspose,
     Detect,
@@ -63,6 +70,7 @@ from ultralytics.nn.modules import (
     TorchVision,
     WorldDetect,
     v10Detect,
+    QUpsample
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -125,6 +133,53 @@ class BaseModel(torch.nn.Module):
         if augment:
             return self._predict_augment(x)
         return self._predict_once(x, profile, visualize, embed)
+
+    # def _predict_once(self, x, profile=False, visualize=False, embed=None):
+    #     """
+    #     Perform a forward pass through the network.
+    #     """
+    #     y, dt, embeddings = [], [], []  # outputs
+        
+    #     model_dtype = next(self.model.parameters()).dtype
+    #     print(f"Model dtype: {model_dtype}")
+    #     print(f"Input dtype: {x.dtype}")
+    #     x = x.to(dtype=model_dtype)
+    #     print(f"Converted input dtype: {x.dtype}")
+
+    #     for m in self.model:
+    #         if m.f != -1:  # if not from previous layer
+    #             x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            
+    #         # Debug print before layer
+    #         print(f"\nLayer {m.__class__.__name__}")
+    #         print(f"Input dtype: {x.dtype if isinstance(x, torch.Tensor) else [t.dtype for t in x if isinstance(t, torch.Tensor)]}")
+            
+    #         # Check layer type and weights safely
+    #         if isinstance(m, QConv2D):
+    #             print(f"QConv2D - Conv_r weight dtype: {m.conv_r.weight.dtype}")
+    #         elif isinstance(m, Conv) and hasattr(m, 'conv'):
+    #             print(f"Conv - Conv weight dtype: {m.conv.weight.dtype}")
+    #         elif isinstance(m, nn.Conv2d):
+    #             print(f"nn.Conv2d weight dtype: {m.weight.dtype}")
+
+    #         if profile:
+    #             self._profile_one_layer(m, x, dt)
+                
+    #         x = m(x)  # run
+            
+    #         # Debug print after layer
+    #         print(f"Output dtype: {x.dtype if isinstance(x, torch.Tensor) else 'Not tensor'}")
+            
+    #         y.append(x if m.i in self.save else None)  # save output
+    #         if visualize:
+    #             feature_visualization(x, m.type, m.i, save_dir=visualize)
+    #         if embed and m.i in embed:
+    #             embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))
+    #             if m.i == max(embed):
+    #                 return torch.unbind(torch.cat(embeddings, 1), dim=0)
+                    
+    #     return x
+
 
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
         """
@@ -632,7 +687,7 @@ class WorldModel(DetectionModel):
         Returns:
             (torch.Tensor): Model's output tensor.
         """
-        txt_feats = (self.txt_feats if txt_feats is None else txt_feats).to(device=x.device, dtype=x.dtype)
+        txt_feats = (self.txt_feats if txt_feats is None else txt_feats).to(device=x.device)
         if len(txt_feats) != len(x):
             txt_feats = txt_feats.repeat(len(x), 1, 1)
         ori_txt_feats = txt_feats.clone()
@@ -956,8 +1011,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             GhostBottleneck,
             SPP,
             SPPF,
+            QSPPF,
             C2fPSA,
             C2PSA,
+            QC2PSA,
             DWConv,
             Focus,
             BottleneckCSP,
@@ -965,6 +1022,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2,
             C2f,
             C3k2,
+            QC3k2,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -988,6 +1046,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             BottleneckCSP,
             C1,
             C2,
+            QC3k2,
             C2f,
             C3k2,
             C2fAttn,
@@ -1044,6 +1103,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is QConcat:
+            c2 = sum(ch[x] for x in f)
+            # c2 = sum(ch[x] // 4 for x in f)
         elif m in frozenset({Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}):
             args.append([ch[x] for x in f])
             if m is Segment:
