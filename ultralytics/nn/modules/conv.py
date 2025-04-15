@@ -46,90 +46,7 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
 
-# def autopad(k, p=None, d=1):  # kernel, padding, dilation
-#     """Pad to 'same' shape outputs. Expects d as int."""
-#     if d > 1:
-#         # Calculate actual kernel size considering dilation
-#         # This part assumes d is an integer.
-#         k_eff = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]
-#     else:
-#         k_eff = k # If d=1, effective kernel size is the same as k
 
-#     # Auto-pad based on the effective kernel size
-#     if p is None:
-#         p = k_eff // 2 if isinstance(k_eff, int) else [x // 2 for x in k_eff]
-#     return p
-
-# class IQBN(nn.Module):
-#     def __init__(self, num_features, eps=1e-5, momentum=0.1):
-#         super().__init__()
-#         # Standard BatchNorm with 4x channels (one for each quaternion component)
-#         self.num_features = num_features
-#         self.eps = eps
-#         self.momentum = momentum
-#         # self.weight = torch.zeros(num_features)
-#         self.bn = nn.BatchNorm2d(self.num_features, self.eps, self.momentum)       
-#     def forward(self, x):
-#         # x shape: [B, C, 4, H, W]
-#         B, C, Q, H, W = x.shape
-#         # Reshape to [B, C*4, H, W]
-#         x_reshaped = x.reshape(B, C*Q, H, W)
-#         # Apply batch norm
-#         x_bn = self.bn(x_reshaped)
-#         # Reshape back to [B, C, 4, H, W]
-#         return x_bn.reshape(B, C, Q, H, W)
-
-# class IQBN(nn.Module):
-#     def __init__(self, num_features, eps=1e-5, momentum=0.1):
-#         super().__init__()
-#         self.num_features = num_features // 4
-#         self.eps = eps
-#         self.momentum = momentum
-        
-#         # Store parameters efficiently
-#         self.gamma = nn.Parameter(torch.ones(1, self.num_features, 4, 1, 1))
-#         self.beta = nn.Parameter(torch.zeros(1, self.num_features, 4, 1, 1))
-        
-#         # Running stats already in broadcast-ready shape
-#         self.register_buffer('running_mean', torch.zeros(1, self.num_features, 4, 1, 1))
-#         self.register_buffer('running_var', torch.ones(1, self.num_features, 4, 1, 1))
-
-#     def forward(self, x):
-#         if not self.training:
-#             # Fast inference path - direct operations with no reshaping
-#             return x * self.gamma.to(x.dtype) * torch.rsqrt(self.running_var + self.eps) + (self.beta - self.running_mean * self.gamma * torch.rsqrt(self.running_var + self.eps))
-        
-#         # Training path - optimize for speed
-#         B, C, Q, H, W = x.shape
-        
-#         # Flatten once
-#         x_flat = x.reshape(B, C, Q, H*W)
-        
-#         # Fast statistics calculation
-#         mean = torch.mean(x_flat, dim=3, keepdim=True).mean(dim=0, keepdim=True)  # [1, C, Q, 1]
-#         # Center the data once
-#         x_centered = x_flat - mean
-#         # Compute variance efficiently
-#         var = torch.mean(x_centered**2, dim=3, keepdim=True).mean(dim=0, keepdim=True)  # [1, C, Q, 1]
-        
-#         # Reshape means and vars only once
-#         mean_reshaped = mean.reshape(1, self.num_features, 4, 1, 1)
-#         var_reshaped = var.reshape(1, self.num_features, 4, 1, 1)
-        
-#         # Update running stats (minimal operations)
-#         if self.momentum != 0.0:
-#             with torch.no_grad():
-#                 self.running_mean.mul_(1 - self.momentum).add_(mean_reshaped * self.momentum)
-#                 self.running_var.mul_(1 - self.momentum).add_(var_reshaped * self.momentum)
-        
-#         # Compute inverse standard deviation once
-#         inv_std = torch.rsqrt(var_reshaped + self.eps)
-        
-#         # Reshape input back to original shape
-#         x = x.reshape(B, C, Q, H, W)
-        
-#         # Apply normalization in most efficient order (minimize intermediate results)
-#         return (x - mean_reshaped) * inv_std * self.gamma + self.beta
 
 class IQBN(nn.Module):
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
@@ -138,42 +55,46 @@ class IQBN(nn.Module):
         self.eps = eps
         self.momentum = momentum
         
-        # Parameters for correct broadcasting
-        self.gamma = nn.Parameter(torch.ones(self.num_features, 4))
-        self.beta = nn.Parameter(torch.zeros(self.num_features, 4))
+        # Store parameters
+        self.gamma = nn.Parameter(torch.ones(1, self.num_features, 4, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, self.num_features, 4, 1, 1))
         
-        # Running stats with correct shapes
-        self.register_buffer('running_mean', torch.zeros(self.num_features, 4))
-        self.register_buffer('running_var', torch.ones(self.num_features, 4))
+        # Running stats already in broadcast-ready shape
+        self.register_buffer('running_mean', torch.zeros(1, self.num_features, 4, 1, 1))
+        self.register_buffer('running_var', torch.ones(1, self.num_features, 4, 1, 1))
 
     def forward(self, x):
-        # Quick shape check
+        if not self.training:
+            return x * self.gamma.to(x.dtype) * torch.rsqrt(self.running_var + self.eps) + (self.beta - self.running_mean * self.gamma * torch.rsqrt(self.running_var + self.eps))
+        
         B, C, Q, H, W = x.shape
         
-        if not self.training:
-            # Faster evaluation using pre-computed stats
-            mean = self.running_mean.view(1, self.num_features, 4, 1, 1)
-            var = self.running_var.view(1, self.num_features, 4, 1, 1)
-            x_norm = (x - mean) / torch.sqrt(var + self.eps)
-            return x_norm * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
+        # Flatten once
+        x_flat = x.reshape(B, C, Q, H*W)
         
-        # Training mode optimized
-        # Batch statistics - process all spatial dimensions at once for efficiency
-        x_flat = x.reshape(B, C, Q, -1)
-        mean = x_flat.mean(dim=[0, 3], keepdim=True)  # [1, C, Q, 1]
-        var = x_flat.var(dim=[0, 3], keepdim=True, unbiased=False) + 1e-8  # Added eps for stability
+        mean = torch.mean(x_flat, dim=3, keepdim=True).mean(dim=0, keepdim=True)  
+        x_centered = x_flat - mean
+        var = torch.mean(x_centered**2, dim=3, keepdim=True).mean(dim=0, keepdim=True) 
+        
+        mean_reshaped = mean.reshape(1, self.num_features, 4, 1, 1)
+        var_reshaped = var.reshape(1, self.num_features, 4, 1, 1)
         
         # Update running stats
-        with torch.no_grad():
-            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean.squeeze()
-            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var.squeeze()
+        if self.momentum != 0.0:
+            with torch.no_grad():
+                self.running_mean.mul_(1 - self.momentum).add_(mean_reshaped * self.momentum)
+                self.running_var.mul_(1 - self.momentum).add_(var_reshaped * self.momentum)
         
-        # Normalize
-        x_norm = (x - mean.view(1, C, Q, 1, 1)) / torch.sqrt(var.view(1, C, Q, 1, 1) + self.eps)
+        # Compute inverse standard deviation
+        inv_std = torch.rsqrt(var_reshaped + self.eps)
         
-        # Apply affine parameters
-        return x_norm * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
-    
+        # Reshape input back to original shape
+        x = x.reshape(B, C, Q, H, W)
+        
+        # Apply normalization
+        return (x - mean_reshaped) * inv_std * self.gamma + self.beta
+
+
 class Conv(nn.Module):
     default_act = nn.SiLU()  # default activation
 
@@ -185,15 +106,9 @@ class Conv(nn.Module):
         self.conv = QConv2D(c1, c2, k, s, padding, groups=g, dilation=d, bias=False)
         self.bn = IQBN(c2)
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
-        # self.conv.stride = s if isinstance(s, tuple) else (s, s)
-        # self.conv.padding = padding if isinstance(padding, tuple) else (padding, padding)
-
-        # self.conv.dilation = d if isinstance(d, tuple) else (d, d)
-        # self.conv.groups = g
 
     def forward(self, x):
         """Apply convolution, batch normalization and activation to input tensor."""
-        # print(f"X type: {x.dtype}")
         return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
@@ -245,10 +160,10 @@ class QConv(nn.Module):
         else:
             Conv = nn.Conv3d
             
-        self.is_first_layer = (in_channels == 3)  # Changed from 4 to 3
+        self.is_first_layer = (in_channels == 3) 
         if self.is_first_layer:
             # For RGB input, map to 4 channels
-            actual_in_channels = 1  # Use this for the convolution
+            actual_in_channels = 1  
         else:
             assert in_channels % 4 == 0, "in_channels must be multiple of 4 for non-first layers"
             actual_in_channels = in_channels // 4
@@ -299,13 +214,11 @@ class QConv(nn.Module):
             # Weight initialization with scaled Kaiming
             nn.init.kaiming_uniform_(conv.weight, a=math.sqrt(5) * scales[i])
             
-            # Bias initialization (if present)
+            # Bias initialization 
             if conv.bias is not None:
-                bound = 1 / math.sqrt(fan_in) * scales[i]  # Scale bias bound by component weight
+                bound = 1 / math.sqrt(fan_in) * scales[i] 
                 nn.init.uniform_(conv.bias, -bound, bound)
-
-
-            # No bias for i, j, k components
+                
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Handle RGB input
         if x.size(1) == 3:  # RGB input
@@ -404,35 +317,6 @@ class QConv2D(QConv):
             mapping_type=mapping_type
         )
 
-    # @property
-    # def weight(self):
-    #     """Compatibility property for functions expecting standard Conv2d weight."""
-    #     # Create a weight tensor that combines the quaternion kernels
-    #     # This is just for compatibility, not for actual computation
-    #     dummy_weight = torch.zeros(
-    #         (self.out_channels, self.in_channels // self.groups, *self.kernel_size)
-    #     )
-    #     return dummy_weight
-# class Conv(nn.Module):
-#     """Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)."""
-
-#     default_act = nn.SiLU()  # default activation
-
-#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-#         """Initialize Conv layer with given arguments including activation."""
-#         super().__init__()
-#         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
-#         self.bn = nn.BatchNorm2d(c2)
-#         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
-
-#     def forward(self, x):
-#         """Apply convolution, batch normalization and activation to input tensor."""
-#         return self.act(self.bn(self.conv(x)))
-
-#     def forward_fuse(self, x):
-#         """Apply convolution and activation without batch normalization."""
-#         return self.act(self.conv(x))
-
 
 
 
@@ -479,7 +363,7 @@ class LightConv(nn.Module):
         """Apply 2 convolutions to input tensor."""
         return self.conv2(self.conv1(x))
 
-
+# Use base ultralytics DW-Conv
 class DWConv(Conv):
     """Depth-wise convolution."""
 
@@ -731,7 +615,7 @@ class Index(nn.Module):
         return x[self.index]
 
 
-
+# Unused Class
 class QConcat(nn.Module):
     def __init__(self, dim=1, reduce=False, target_channels=None):
         super().__init__()
@@ -784,73 +668,3 @@ class QUpsample(nn.Module):
         x = x.reshape(B, Q, C, H_new, W_new).permute(0, 2, 1, 3, 4)
         
         return x
-
-# class DWConv(nn.Module):
-#     """Quaternion Depthwise Convolution (Simplified & Corrected)."""
-#     default_act = nn.SiLU()
-
-#     def __init__(self, c1, c2, k=3, s=1, d=1, act=True):
-#         super().__init__()
-#         # DWConv requires input channels == output channels
-#         if c1 != c2:
-#             # This might be okay if subsequent layers handle it, but unusual for pure DWConv
-#             # print(f"Warning: DWConv initialized with c1={c1}, c2={c2}. Standard DWConv has c1=c2.")
-#             # Let's proceed assuming the definition allows c1!=c2, but apply depthwise based on c1
-#              pass # Allow c1 != c2 based on usage in head (DW(x,x) then Conv(x,c3))
-
-
-#         if c1 % 4 != 0:
-#             raise ValueError(f"DWConv input channels c1={c1} must be a multiple of 4.")
-#         if c2 % 4 != 0:
-#             raise ValueError(f"DWConv output channels c2={c2} must be a multiple of 4.")
-
-#         qc1 = c1 // 4 # Input channels per component
-#         qc2 = c2 // 4 # Output channels per component
-
-#         # Key: groups = qc1 makes it depthwise *relative to the input components*
-#         # Each input component channel gets its own filter kernel.
-#         groups = qc1
-#         padding = autopad(k, None, d)
-
-#         # Define the 4 component-wise convolutions. They are depthwise w.r.t qc1.
-#         # Output channels are qc2. If c1=c2, then qc1=qc2.
-#         self.conv_r = nn.Conv2d(qc1, qc2, k, s, padding, groups=groups, dilation=d, bias=False)
-#         self.conv_i = nn.Conv2d(qc1, qc2, k, s, padding, groups=groups, dilation=d, bias=False)
-#         self.conv_j = nn.Conv2d(qc1, qc2, k, s, padding, groups=groups, dilation=d, bias=False)
-#         self.conv_k = nn.Conv2d(qc1, qc2, k, s, padding, groups=groups, dilation=d, bias=False)
-
-#         # Use the efficient IQBN - applies normalization across the final C2 channels
-#         self.bn = IQBN(c2)
-#         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
-
-#         # Store attributes for potential use/inspection
-#         self.stride = s
-#         self.padding = padding
-#         self.kernel_size = k
-#         self.dilation = d
-#         self.groups = groups # Note: groups *per component convolution*
-
-#     def forward(self, x):
-#         # Input x expected shape: [B, qc1, 4, H, W]
-#         x_r = x[:, :, 0, :, :] # Shape: [B, qc1, H, W]
-#         x_i = x[:, :, 1, :, :] # Shape: [B, qc1, H, W]
-#         x_j = x[:, :, 2, :, :] # Shape: [B, qc1, H, W]
-#         x_k = x[:, :, 3, :, :] # Shape: [B, qc1, H, W]
-
-#         # Apply component-wise depthwise conv based on input qc1
-#         # Output shapes: [B, qc2, H', W']
-#         # Hamilton product structure requires applying the kernel components (conv_r..k)
-#         # to the input components (x_r..k) correctly.
-#         final_r = self.conv_r(x_r) - self.conv_i(x_i) - self.conv_j(x_j) - self.conv_k(x_k)
-#         final_i = self.conv_r(x_i) + self.conv_i(x_r) + self.conv_j(x_k) - self.conv_k(x_j)
-#         final_j = self.conv_r(x_j) - self.conv_i(x_k) + self.conv_j(x_r) + self.conv_k(x_i)
-#         final_k = self.conv_r(x_k) + self.conv_i(x_j) - self.conv_j(x_i) + self.conv_k(x_r)
-
-#         # Stack results: shape [B, qc2, 4, H', W']
-#         out_stacked = torch.stack([final_r, final_i, final_j, final_k], dim=2)
-
-#         # Apply Batch Norm (IQBN handles the internal reshape) and Activation
-#         # bn receives [B, qc2, 4, H', W'] and operates across the full c2 channels.
-#         return self.act(self.bn(out_stacked))
-    
-
