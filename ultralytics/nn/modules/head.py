@@ -52,42 +52,42 @@ OG Class
 Learnable Class
 '''
 
-class QER(nn.Module):
-    def __init__(self, in_channels, out_channels=None):
-        super().__init__()
-        self.act = nn.SiLU()
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.output_proj = nn.Conv2d(in_channels * 4, out_channels, kernel_size=1)
-        self.bias = self.output_proj.bias
-    def forward(self, x):
-        B, C, Q, H, W = x.shape
-        x = x.permute(0, 2, 1, 3, 4).reshape(B, C*4, H, W)
-        return self.output_proj(x)
-
 # class QER(nn.Module):
 #     def __init__(self, in_channels, out_channels=None):
 #         super().__init__()
-#         # Initialize with bias toward real component
-#         self.weights = nn.Parameter(torch.tensor([1.5, 0.8, 0.8, 0.8]))
-#         # The 1x1 conv will handle channel transformations
-#         self.output_proj = nn.Conv2d(in_channels, out_channels, 1)
-#         # Register a buffer for target weights - not used in computation but accessible
-#         self.register_buffer('target_weights', torch.tensor([1.5, 0.8, 0.8, 0.8]))
-#         self.bias = self.output_proj.bias
 #         self.act = nn.SiLU()
 #         self.bn = nn.BatchNorm2d(out_channels)
+#         self.output_proj = nn.Conv2d(in_channels * 4, out_channels, kernel_size=1)
+#         self.bias = self.output_proj.bias
 #     def forward(self, x):
 #         B, C, Q, H, W = x.shape
-#         # Normalize weights for weighted sum
-#         weights = F.softmax(self.weights, dim=0).view(1, 1, 4, 1, 1)
-#         # Weighted sum across quaternion components
-#         projected = (x * weights).sum(dim=2)  # Shape: [B, C, H, W]
-#         return self.output_proj(projected)
+#         x = x.permute(0, 2, 1, 3, 4).reshape(B, C*4, H, W)
+#         return self.output_proj(x)
+
+class QER(nn.Module):
+    def __init__(self, in_channels, out_channels=None):
+        super().__init__()
+        # Initialize with bias toward real component
+        self.weights = nn.Parameter(torch.tensor([1.5, 0.8, 0.8, 0.8]))
+        # The 1x1 conv will handle channel transformations
+        self.output_proj = nn.Conv2d(in_channels, out_channels, 1)
+        # Register a buffer for target weights - not used in computation but accessible
+        self.register_buffer('target_weights', torch.tensor([1.5, 0.8, 0.8, 0.8]))
+        self.bias = self.output_proj.bias
+        self.act = nn.SiLU()
+        self.bn = nn.BatchNorm2d(out_channels)
+    def forward(self, x):
+        B, C, Q, H, W = x.shape
+        # Normalize weights for weighted sum
+        weights = F.softmax(self.weights, dim=0).view(1, 1, 4, 1, 1)
+        # Weighted sum across quaternion components
+        projected = (x * weights).sum(dim=2)  # Shape: [B, C, H, W]
+        return self.output_proj(projected)
         
         
-#     def get_reg_loss(self):
-#         """Return regularization loss term to add to main loss"""
-#         return 0.01 * F.mse_loss(self.weights, self.target_weights)
+    def get_reg_loss(self):
+        """Return regularization loss term to add to main loss"""
+        return 0.01 * F.mse_loss(self.weights, self.target_weights)
 
 '''
 Real Projection Class
