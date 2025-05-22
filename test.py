@@ -58,5 +58,5 @@ def plot_metrics_from_csv(csv_filepath):
 
 # Example usage
 if __name__ == "__main__":
-    csv_file = "runs/detect/train90/results.csv"
+    csv_file = "runs\\detect\\train73\\results.csv"
     plot_metrics_from_csv(csv_file)

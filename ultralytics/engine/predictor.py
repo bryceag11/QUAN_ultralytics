@@ -314,7 +314,7 @@ class BasePredictor:
             data=self.args.data,
             fp16=self.args.half,
             batch=self.args.batch,
-            fuse=True,
+            fuse=False,
             verbose=verbose,
         )
 

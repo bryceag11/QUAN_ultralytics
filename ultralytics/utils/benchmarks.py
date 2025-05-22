@@ -49,8 +49,8 @@ from ultralytics.utils.torch_utils import get_cpu_info, select_device
 
 
 def benchmark(
-    model=WEIGHTS_DIR / "yolo11n.pt",
-    data='ultralytics/cfg/datasets/aism2.yaml',
+    model="runs/detect/mar_aism_exps/train77/weights/best.pt",
+    data='C:/Users/bag100/ultralytics/ultralytics/cfg/datasets/aism2.yaml',
     imgsz=640,
     half=False,
     int8=False,

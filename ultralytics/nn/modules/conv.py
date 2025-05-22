@@ -6,11 +6,12 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Union, Tuple
+from typing import Union, Tuple, Optional
 import torch.nn.functional as F
 from .activation import *
 from torch.jit import script
 from torch.utils import cpp_extension
+
 
 __all__ = (
     "Conv",
@@ -48,73 +49,125 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
 
 
 
+
 class IQBN(nn.Module):
+    # Independent Quaternion Batch Norm
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
         super().__init__()
         self.num_features = num_features // 4
         self.eps = eps
         self.momentum = momentum
         
-        # Store parameters
-        self.gamma = nn.Parameter(torch.ones(1, self.num_features, 4, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, self.num_features, 4, 1, 1))
+        # Parameters for correct broadcasting
+        self.gamma = nn.Parameter(torch.ones(self.num_features, 4))
+        self.beta = nn.Parameter(torch.zeros(self.num_features, 4))
         
-        # Running stats already in broadcast-ready shape
-        self.register_buffer('running_mean', torch.zeros(1, self.num_features, 4, 1, 1))
-        self.register_buffer('running_var', torch.ones(1, self.num_features, 4, 1, 1))
+        # Running stats with correct shapes
+        self.register_buffer('running_mean', torch.zeros(self.num_features, 4))
+        self.register_buffer('running_var', torch.ones(self.num_features, 4))
 
     def forward(self, x):
-        if not self.training:
-            return x * self.gamma.to(x.dtype) * torch.rsqrt(self.running_var + self.eps) + (self.beta - self.running_mean * self.gamma * torch.rsqrt(self.running_var + self.eps))
-        
+        # Quick shape check
         B, C, Q, H, W = x.shape
         
-        # Flatten once
-        x_flat = x.reshape(B, C, Q, H*W)
+        if not self.training:
+            # Faster evaluation using pre-computed stats
+            mean = self.running_mean.view(1, self.num_features, 4, 1, 1)
+            var = self.running_var.view(1, self.num_features, 4, 1, 1)
+            x_norm = (x - mean) / torch.sqrt(var + self.eps)
+            return x_norm * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
         
-        mean = torch.mean(x_flat, dim=3, keepdim=True).mean(dim=0, keepdim=True)  
-        x_centered = x_flat - mean
-        var = torch.mean(x_centered**2, dim=3, keepdim=True).mean(dim=0, keepdim=True) 
-        
-        mean_reshaped = mean.reshape(1, self.num_features, 4, 1, 1)
-        var_reshaped = var.reshape(1, self.num_features, 4, 1, 1)
+        # Training mode optimized
+        # Batch statistics - process all spatial dimensions at once for efficiency
+        x_flat = x.reshape(B, C, Q, -1)
+        mean = x_flat.mean(dim=[0, 3], keepdim=True)  # [1, C, Q, 1]
+        var = x_flat.var(dim=[0, 3], keepdim=True, unbiased=False) + 1e-8  # Added eps for stability
         
         # Update running stats
-        if self.momentum != 0.0:
-            with torch.no_grad():
-                self.running_mean.mul_(1 - self.momentum).add_(mean_reshaped * self.momentum)
-                self.running_var.mul_(1 - self.momentum).add_(var_reshaped * self.momentum)
+        with torch.no_grad():
+            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean.squeeze()
+            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var.squeeze()
         
-        # Compute inverse standard deviation
-        inv_std = torch.rsqrt(var_reshaped + self.eps)
+        # Normalize
+        x_norm = (x - mean.view(1, C, Q, 1, 1)) / torch.sqrt(var.view(1, C, Q, 1, 1) + self.eps)
         
-        # Reshape input back to original shape
-        x = x.reshape(B, C, Q, H, W)
-        
-        # Apply normalization
-        return (x - mean_reshaped) * inv_std * self.gamma + self.beta
+        # Apply affine parameters
+        return x_norm * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
 
-
-class Conv(nn.Module):
-    default_act = nn.SiLU()  # default activation
-
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-        """Initialize Conv layer with given arguments including activation."""
+# To be used in your conv.py, replacing the original IQBN
+class IQBN_nn(nn.Module):
+    # Independent Quaternion Batch Norm using nn.BatchNorm2d
+    def __init__(self, num_features_real, eps=1e-5, momentum=0.1):
+        """
+        Args:
+            num_features_real (int): Total number of real-valued features after flattening
+                                     the quaternion dimension. Expected to be C_quaternion * 4.
+        """
         super().__init__()
-        padding = autopad(k, p, d)
+        if num_features_real % 4 != 0:
+            raise ValueError("num_features_real must be a multiple of 4.")
+        
+        self.num_quaternion_features = num_features_real // 4
+        
+        # nn.BatchNorm2d operates on the [B, C_real, H, W] tensor
+        self.bn = nn.BatchNorm2d(num_features_real, eps=eps, momentum=momentum)
 
-        self.conv = QConv2D(c1, c2, k, s, padding, groups=g, dilation=d, bias=False)
-        self.bn = IQBN(c2)
-        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape [B, C_quat, 4, H, W]
+        Returns:
+            torch.Tensor: Output tensor of the same shape.
+        """
+        B, C_quat, Q, H, W = x.shape
+        if Q != 4:
+            raise ValueError("Input tensor must have Q=4 (quaternion dimension).")
+        if C_quat != self.num_quaternion_features:
+            raise ValueError(
+                f"Input quaternion channels {C_quat} does not match "
+                f"initialized num_quaternion_features {self.num_quaternion_features}."
+            )
 
+        # Reshape to [B, C_quat*4, H, W] for nn.BatchNorm2d
+        # Permute Q to be adjacent to C_quat, then reshape to merge them.
+        # x_reshaped = x.permute(0, 1, 2, 3, 4).reshape(B, C_quat * Q, H, W) # Original thought
+        # A more direct way if C and Q are already adjacent in memory after QConv:
+        x_reshaped = x.reshape(B, C_quat * Q, H, W)
+        if not x_reshaped.is_contiguous(): # Ensure contiguity if reshape alone doesn't achieve it
+            x_reshaped = x_reshaped.contiguous()
+
+        # Apply BatchNorm
+        x_bn = self.bn(x_reshaped)
+        
+        # Reshape back to [B, C_quat, 4, H, W]
+        x_out = x_bn.view(B, C_quat, Q, H, W)
+        
+        return x_out
+
+    def __repr__(self):
+        return (f"{self.__class__.__name__}(num_quaternion_features={self.num_quaternion_features}, "
+                f"eps={self.bn.eps}, momentum={self.bn.momentum})")
+
+
+class IQLN(nn.Module):
+    def __init__(self, num_features, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+        # Standard LayerNorm
+        self.ln = nn.LayerNorm(num_features, eps=eps, elementwise_affine=elementwise_affine)
+        
     def forward(self, x):
-        """Apply convolution, batch normalization and activation to input tensor."""
-        return self.act(self.bn(self.conv(x)))
-
-    def forward_fuse(self, x):
-        """Apply convolution and activation without batch normalization."""
-        return self.act(self.conv(x))
-
+        # x shape: [B, C, 4, H, W]
+        B, C, Q, H, W = x.shape
+        
+        # Reshape to put all except batch dimension together for LayerNorm
+        # LayerNorm expects shape [B, *] where * are the normalized dimensions
+        x_reshaped = x.permute(0, 3, 4, 1, 2).reshape(B, H*W, C*Q)
+        
+        # Apply layer norm
+        x_ln = self.ln(x_reshaped)
+        
+        # Reshape back to [B, C, 4, H, W]
+        return x_ln.reshape(B, H, W, C, Q).permute(0, 3, 4, 1, 2)
 
 
 class QConv(nn.Module):
@@ -187,8 +240,10 @@ class QConv(nn.Module):
         self.conv_k = Conv(actual_in_channels, out_channels_quat, kernel_size,
                           stride, padding, dilation, groups, False, 
                           padding_mode)
-                      
+
         self._initialize_weights()
+
+
 
 
     # Bias for all layers weight init
@@ -247,10 +302,11 @@ class QConv(nn.Module):
             k_conv = self.conv_k(x_k)
         
         # Use in-place operations and fuse calculations where possible
-        out_r = r_conv - i_conv - j_conv - k_conv  # No in-place for first op
+        out_r = r_conv
+        out_r.sub_(i_conv).sub_(j_conv).sub_(k_conv)
         
-        out_i = r_conv.clone() 
-        out_i.add_(i_conv).add_(j_conv).sub_(k_conv)  # Chain in-place ops
+        out_i = r_conv.clone()
+        out_i.add_(i_conv).add_(j_conv).sub_(k_conv)
         
         out_j = r_conv.clone()
         out_j.sub_(i_conv).add_(j_conv).add_(k_conv)
@@ -258,8 +314,13 @@ class QConv(nn.Module):
         out_k = r_conv.clone()
         out_k.add_(i_conv).sub_(j_conv).add_(k_conv)
         
+        out = torch.stack([out_r, out_i, out_j, out_k], dim=2)
+        
+        # Clean up immediate tensors
+        del r_conv, i_conv, j_conv, k_conv
+
         # Stack outputs efficiently
-        return torch.stack([out_r, out_i, out_j, out_k], dim=2)
+        return out
         
 
     def rgb_to_quaternion(self, rgb_input):
@@ -274,7 +335,7 @@ class QConv(nn.Module):
         
         def poincare_mapping(x):
             norm = torch.norm(x, dim=1, keepdim=True)
-            x_normalized = (x / (norm + 1))
+            x_normalized = (x / (norm + 1)).to(x.device)
             return torch.cat([torch.sqrt(1 - torch.sum(x_normalized**2, dim=1, keepdim=True)), 
                             x_normalized[:, 0:1], x_normalized[:, 1:2], x_normalized[:, 2:3]], dim=1)
         
@@ -287,7 +348,8 @@ class QConv(nn.Module):
             'poincare': poincare_mapping(rgb_input)
         }
         return mappings[self.mapping_type]
-    
+
+
 class QConv2D(QConv):
     """2D Quaternion Convolution layer."""
     def __init__(self,
@@ -317,6 +379,93 @@ class QConv2D(QConv):
             mapping_type=mapping_type
         )
 
+# Conv using quaternion conv
+class Conv(nn.Module):
+    default_act = nn.SiLU()  # default activation
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        """Initialize Conv layer with given arguments including activation."""
+        super().__init__()
+        padding = autopad(k, p, d)
+
+        self.conv = QConv2D(c1, c2, k, s, padding, groups=g, dilation=d, bias=False)
+        self.bn = nn.IQBN(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        # self.conv.stride = s if isinstance(s, tuple) else (s, s)
+        # self.conv.padding = padding if isinstance(padding, tuple) else (padding, padding)
+
+        # self.conv.dilation = d if isinstance(d, tuple) else (d, d)
+        # self.conv.groups = g
+
+    def forward(self, x):
+        """Apply convolution, batch normalization and activation to input tensor."""
+        # print(f"X type: {x.dtype}")
+        out = self.conv(x)
+        out = self.bn(out)
+        out = self.act(out)
+        return out
+
+    def forward_fuse(self, x):
+        """Apply convolution and activation without batch normalization."""
+        out = self.conv(x)
+        out = self.act(out)
+        return out
+
+# class Conv(nn.Module):
+#     """
+#     Standard convolution module with batch normalization and activation.
+
+#     Attributes:
+#         conv (nn.Conv2d): Convolutional layer.
+#         bn (nn.BatchNorm2d): Batch normalization layer.
+#         act (nn.Module): Activation function layer.
+#         default_act (nn.Module): Default activation function (SiLU).
+#     """
+
+#     default_act = nn.SiLU()  # default activation
+
+#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+#         """
+#         Initialize Conv layer with given parameters.
+
+#         Args:
+#             c1 (int): Number of input channels.
+#             c2 (int): Number of output channels.
+#             k (int): Kernel size.
+#             s (int): Stride.
+#             p (int, optional): Padding.
+#             g (int): Groups.
+#             d (int): Dilation.
+#             act (bool | nn.Module): Activation function.
+#         """
+#         super().__init__()
+#         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+#         self.bn = nn.BatchNorm2d(c2)
+#         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+#     def forward(self, x):
+#         """
+#         Apply convolution, batch normalization and activation to input tensor.
+
+#         Args:
+#             x (torch.Tensor): Input tensor.
+
+#         Returns:
+#             (torch.Tensor): Output tensor.
+#         """
+#         return self.act(self.bn(self.conv(x)))
+
+#     def forward_fuse(self, x):
+#         """
+#         Apply convolution and activation without batch normalization.
+
+#         Args:
+#             x (torch.Tensor): Input tensor.
+
+#         Returns:
+#             (torch.Tensor): Output tensor.
+#         """
+#         return self.act(self.conv(x))
 
 
 
@@ -653,18 +802,14 @@ class QUpsample(nn.Module):
         super().__init__()
         self.scale_factor = scale_factor
         self.mode = mode
-    
+
     def forward(self, x):
         B, C, Q, H, W = x.shape
-        
-        # Reshape to handle quaternion components separately
-        x = x.permute(0, 2, 1, 3, 4).reshape(B*Q, C, H, W)
-        
-        # Upsample
+        # Flatten Q into channel dim
+        x = x.view(B, C * Q, H, W)
+        # Apply upsampling once across all channels
         x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
-        
         # Reshape back to quaternion format
-        _, _, H_new, W_new = x.shape
-        x = x.reshape(B, Q, C, H_new, W_new).permute(0, 2, 1, 3, 4)
-        
+        x = x.view(B, C, Q, x.shape[-2], x.shape[-1])
         return x
+

@@ -705,6 +705,7 @@ def check_amp(model):
         from ultralytics import YOLO
 
         assert amp_allclose(YOLO("yolo11n.pt"), im)
+        # assert amp_allclose(YOLO("yolov12n.pt"), im)
         LOGGER.info(f"{prefix}checks passed ✅")
     except ConnectionError:
         LOGGER.warning(
