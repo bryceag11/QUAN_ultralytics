@@ -100,6 +100,10 @@ from .transformer import (
     TransformerLayer,
 )
 
+from .quaternion_autograd_cuda import QConvFunction
+import test
+
+
 __all__ = (
     "Conv",
     "Conv2",

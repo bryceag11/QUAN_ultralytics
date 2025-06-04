@@ -1,435 +1,357 @@
-import torch
-import torch.nn as nn
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+"""
+Advanced benchmarking for YOLO models with layer-by-layer profiling.
+
+Features:
+- PyTorch model benchmarking with zero tensors or custom data
+- Dataset validation with mAP metrics reporting
+- Layer-by-layer profiling for detailed timing analysis (always prints full table)
+- No export dependency
+
+Usage:
+    from advanced_benchmark import benchmark_pytorch, profile_layers
+
+    # Basic benchmark
+    benchmark_pytorch(model="yolo11n.pt", imgsz=640)
+
+    # Profile individual layers on a batch of images from a dataset YAML
+    profile_layers(
+        model="yolo11n.pt",
+        imgsz=640,
+        batch_size=8,
+        data="path/to/your_dataset.yaml"
+    )
+"""
+
+import os
 import time
-import numpy as np
-import argparse
+import glob
+import yaml
 from pathlib import Path
-from collections import defaultdict
-import pandas as pd
-import matplotlib.pyplot as plt
-from contextlib import contextmanager
-import gc
-import sys
-from tqdm import tqdm
 
-sys.path.append('.')  # Add current directory to path
+import numpy as np
+import torch
+from PIL import Image
+
 from ultralytics import YOLO
+from ultralytics.cfg import TASK2METRIC
+from ultralytics.utils import TQDM
+from ultralytics.utils.checks import check_imgsz
+from ultralytics.utils.torch_utils import select_device
 
 
-@contextmanager
-def timer_context():
-    """Context manager for timing code execution."""
-    start = time.time()
-    yield
-    end = time.time()
-    elapsed_time = (end - start) * 1000  # milliseconds
-    return elapsed_time
+def benchmark_pytorch(
+    model="yolo11n.pt",
+    data=None,
+    imgsz=640,
+    half=False,
+    int8=False,
+    device="cuda",
+    verbose=True,
+    batch_size=1,
+    warmup_iterations=25,
+    benchmark_iterations=100,
+):
+    imgsz = check_imgsz(imgsz)
+    device = select_device(device, verbose=False)
 
+    # Load model
+    if isinstance(model, (str, Path)):
+        model = YOLO(model)
+    model_name = Path(model.ckpt_path).stem if hasattr(model, 'ckpt_path') and model.ckpt_path else model.model_name
+    model = model.to(device)
 
-class ModelProfiler:
-    """
-    A profiler for comparing quaternion and regular YOLO models.
-    Focuses on layer-by-layer timing and memory usage without ONNX exports.
-    """
-    
-    def __init__(self, 
-                 q_model_path,
-                 regular_model_path=None,
-                 imgsz=640, 
-                 num_warmup_runs=10, 
-                 num_timed_runs=100,
-                 device=None, 
-                 input_data=None):
-        """
-        Initialize the ModelProfiler.
-        
-        Args:
-            q_model_path (str): Path to quaternion model file or config
-            regular_model_path (str, optional): Path to regular model file or config
-            imgsz (int): Image size for inference
-            num_warmup_runs (int): Number of warmup runs before timing
-            num_timed_runs (int): Number of timed runs for averaging
-            device (str, optional): Device to run on ('cpu', '0', etc.)
-        """
-        self.q_model_path = q_model_path
-        self.regular_model_path = regular_model_path
-        self.imgsz = imgsz
-        self.num_warmup_runs = num_warmup_runs
-        self.num_timed_runs = num_timed_runs
-        self.device = device or ('0' if torch.cuda.is_available() else 'cpu')
-        
-        # Model loading
-        print(f"Loading quaternion model from {q_model_path}...")
-        self.q_model = YOLO(q_model_path)
-        
-        if regular_model_path:
-            print(f"Loading regular model from {regular_model_path}...")
-            self.regular_model = YOLO(regular_model_path)
+    if verbose:
+        print(f"Benchmarking {model_name} on {device} device")
+    total_params = sum(p.numel() for p in model.model.parameters())
+    print(f"Total parameters: {total_params/1e6:.2f}M")
+    # Determine if we should use a dataset or zeros
+    use_dataset = False
+    if data:
+        if verbose:
+            print(f"Using dataset: {data}")
+        if str(data).endswith(('.yaml', '.yml')):
+            use_dataset = True
+        elif os.path.isfile(data) and str(data).lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+            try:
+                img = Image.open(data).convert('RGB').resize((imgsz, imgsz))
+                input_tensor = np.array(img)
+                if verbose:
+                    print(f"Using image: {data} with shape {input_tensor.shape}")
+            except Exception as e:
+                print(f"Failed to load image: {e}, falling back to zeros")
+                input_tensor = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
         else:
-            self.regular_model = None
-        
-        # Create synthetic input data
-        # self.create_input_data()
-        
-        # Results storage
-        self.results = {
-            'quaternion': {
-                'total_time': 0,
-                'layer_times': defaultdict(list),
-                'layer_memory': defaultdict(list),
-                'params': 0,
-                'flops': 0
-            }
-        }
-        
-        if self.regular_model:
-            self.results['regular'] = {
-                'total_time': 0,
-                'layer_times': defaultdict(list),
-                'layer_memory': defaultdict(list),
-                'params': 0,
-                'flops': 0
-            }
-    
-    def create_input_data(self):
-        """Create synthetic input data for inference."""
-        self.input_data = (
-            torch.randint(0, 255, (1, 3, self.imgsz, self.imgsz), dtype=torch.uint8)
-            .float()
-            .div(255.0)
-            .to(self.device)
+            if verbose:
+                print(f"Data path {data} is not a supported file type, falling back to zeros")
+            input_tensor = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
+    else:
+        input_tensor = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
+        if verbose:
+            print("No data provided, using zero tensors")
+
+    # Warm-up runs
+    if verbose:
+        print(f"Performing {warmup_iterations} warm-up iterations...")
+    for _ in range(warmup_iterations):
+        if not use_dataset:
+            model.predict(input_tensor, imgsz=imgsz, verbose=False)
+
+    # Benchmark time for dataset if specified
+    if use_dataset:
+        if verbose:
+            print(f"Benchmarking with dataset {data}...")
+        start_time = time.time()
+        results = model.val(
+            data=data,
+            batch=batch_size,
+            imgsz=imgsz,
+            plots=False,
+            device=device,
+            half=half,
+            int8=int8,
+            verbose=verbose
         )
-        
-    def measure_layer_performance(self, model, model_type='quaternion'):
-        """
-        Measure performance of each layer in the model.
-        
-        Args:
-            model: The YOLO model to profile
-            model_type (str): Either 'quaternion' or 'regular'
-            
-        Returns:
-            dict: Performance metrics
-        """
-        results = self.results[model_type]
-        model_instance = model.model
-        
-        # Get access to the model
-        if hasattr(model_instance, 'model'):
-            layers = model_instance.model
+        validation_time = time.time() - start_time
+
+        metrics_dict = results.results_dict
+        key = TASK2METRIC[model.task]
+        main_metric = metrics_dict[key]
+        map50 = metrics_dict.get("metrics/mAP50(B)", None)
+        map50_95 = metrics_dict.get("metrics/mAP50-95(B)", None)
+        inference_time = results.speed.get('inference', 0)
+        total_time_per_image = sum(results.speed.values())
+        fps = round(1000 / total_time_per_image, 2) if total_time_per_image > 0 else 0
+
+        print("\n" + "=" * 80)
+        print(f"PyTorch Benchmark Results for {model_name}")
+        print("=" * 80)
+        print(f"Dataset     : {Path(data).stem}")
+        print(f"Image Size  : {imgsz}")
+        print(f"Batch Size  : {batch_size}")
+        print(f"Device      : {device}")
+        print(f"Speed       : {inference_time} ms/image (inference)")
+        print(f"Total Time  : {total_time_per_image} ms/image")
+        print(f"Throughput  : {fps} FPS")
+        if map50 is not None:
+            print(f"mAP@0.5     : {map50:.4f}")
+        if map50_95 is not None:
+            print(f"mAP@0.5:0.95: {map50_95:.4f}")
+        print("=" * 80)
+
+        return {
+            "model": model_name,
+            "dataset": Path(data).stem,
+            "imgsz": imgsz,
+            "batch_size": batch_size,
+            "device": device,
+            "inference_time_ms": inference_time,
+            "total_time_ms": total_time_per_image,
+            "FPS": fps,
+            "accuracy": main_metric,
+            "mAP50": map50,
+            "mAP50-95": map50_95
+        }
+
+    # Benchmark with zero tensors
+    if verbose:
+        print(f"Benchmarking with {benchmark_iterations} iterations...")
+    run_times = []
+    for _ in TQDM(range(benchmark_iterations), desc=f"Benchmarking {model_name}"):
+        res = model.predict(input_tensor, imgsz=imgsz, verbose=False)
+        run_times.append(res[0].speed["inference"])
+    run_times = iterative_sigma_clipping(np.array(run_times), sigma=2, max_iters=3)
+    mean_time = float(np.mean(run_times))
+    std_time = float(np.std(run_times))
+    fps = round(1000 / mean_time, 2)
+
+    print("\n" + "=" * 80)
+    print(f"PyTorch Benchmark Results for {model_name}")
+    print("=" * 80)
+    print(f"Dataset     : {'zeros' if data is None else Path(data).stem}")
+    print(f"Image Size  : {imgsz}")
+    print(f"Device      : {device}")
+    print(f"Speed       : {mean_time:.2f} ± {std_time:.2f} ms/image")
+    print(f"Throughput  : {fps} FPS")
+    print("=" * 80)
+
+    return {
+        "model": model_name,
+        "dataset": 'zeros' if data is None else Path(data).stem,
+        "imgsz": imgsz,
+        "device": device,
+        "ms_per_image": round(mean_time, 2),
+        "ms_std": round(std_time, 2),
+        "FPS": fps
+    }
+
+
+def profile_layers(
+    model="runs/detect/mar_aism_exps/train77/weights/best.pt",
+    data=None,               # Path to your dataset YAML or a single image
+    imgsz=640,
+    device="cuda",
+    batch_size=1,
+    iterations=10
+):
+    """
+    Profile each layer of a YOLO model for performance analysis using PyTorch hooks.
+    Always prints a full layer-by-layer table and summary.
+    """
+
+    # —— Setup device and model —————————————
+    device = select_device(device, verbose=False)
+    if isinstance(model, (str, Path)):
+        model = YOLO(model)
+    model = model.to(device)
+    model.model.eval()
+
+    img_size = (imgsz, imgsz) if isinstance(imgsz, int) else tuple(imgsz)
+
+    # —— Build input batch —————————————
+    def load_from_yaml(yaml_path):
+        cfg = yaml.safe_load(Path(yaml_path).read_text())
+        root = Path(cfg.get('path', Path(yaml_path).parent))
+        if not root.is_absolute():
+            root = (Path(yaml_path).parent / root).resolve()
+        imgs = []
+        for split in ('train', 'val'):
+            val = cfg.get(split)
+            if not val:
+                continue
+            p = Path(val)
+            if not p.is_absolute():
+                p = (root / p).resolve()
+            imgs += [str(f) for f in p.rglob('*') if f.suffix.lower() in ('.jpg', '.jpeg', '.png', '.bmp')]
+        return sorted(imgs)[:batch_size]
+
+    if data and data.lower().endswith(('.yaml', '.yml')):
+        files = load_from_yaml(data)
+        if files:
+            arrs = []
+            for fp in files:
+                im = Image.open(fp).convert("RGB").resize(img_size)
+                arrs.append(np.array(im).transpose(2, 0, 1))  # C,H,W
+            batch = np.stack(arrs, axis=0)                   # B,C,H,W
+            im = torch.from_numpy(batch).to(device).float() / 255.0
+            print(f"Loaded {len(files)} images from {data}")
         else:
-            layers = model_instance
-        
-        # Register hooks for all layers
-        hooks = []
-        layer_times = defaultdict(list)
-        layer_memory = defaultdict(list)
-        
-        def forward_hook(name):
-            def hook(module, input, output):
-                start = time.perf_counter()
-                result = module.forward_original(input[0])
-                end = time.perf_counter()
-                layer_times[name].append((end - start) * 1000)  # ms
-                
-                # Memory usage if GPU
-                if self.device != 'cpu':
-                    mem = torch.cuda.memory_allocated() / (1024 ** 2)  # MB
-                    layer_memory[name].append(mem)
-                
-                return result
-            return hook
-        
-        # Add hooks to each layer
-        for i, layer in enumerate(layers):
-            layer_name = f"{layer.type}_{layer.i}"
-            # Store original forward method
-            layer.forward_original = layer.forward
-            # Create and register a new forward method
-            hook_fn = forward_hook(layer_name)
-            hook = layer.register_forward_hook(hook_fn)
-            hooks.append(hook)
-        
-        # Warmup runs
-        for _ in range(self.num_warmup_runs):
-            with torch.no_grad():
-                for batch in self.input_data:
-                    x = batch[0] if isinstance(batch, (list, tuple)) else batch
-                    model(x.to(self.device), verbose=False)
-                    break
+            print(f"⚠️ No images found in {data}, falling back to zeros")
+            im = torch.zeros(batch_size, 3, *img_size, device=device)
+    elif data and os.path.isfile(data):
+        base = Image.open(data).convert("RGB").resize(img_size)
+        arr  = np.array(base).transpose(2, 0, 1)
+        im   = torch.from_numpy(arr).unsqueeze(0).to(device).float() / 255.0
+        im   = im.repeat(batch_size, 1, 1, 1)
+        print(f"Profiling on single image {data} ×{batch_size}")
+    else:
+        print(f"No valid data input, using zero tensor of shape ({batch_size},3,{imgsz},{imgsz})")
+        im = torch.zeros(batch_size, 3, *img_size, device=device)
+
+    # —— Profiling hooks —————————————
+    def time_sync():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return time.time()
+
+    layers = list(model.model.model)
+    hooks, elapsed = [], {}
+
+    for idx, layer in enumerate(layers):
+        def pre_hook(m, inp, idx=idx):
+            m._t0 = time_sync()
+        hooks.append(layer.register_forward_pre_hook(pre_hook))
+
+        def post_hook(m, inp, out, idx=idx):
+            dt = (time_sync() - m._t0) * 1000
+            name = f"{idx:03d} {m.__class__.__name__}"
+            elapsed.setdefault(name, []).append(dt)
+            del m._t0
+        hooks.append(layer.register_forward_hook(post_hook))
+
+    # —— Warm‑up & timed runs —————————————
+    with torch.no_grad():
+        _ = model.predict(source=im, verbose=False)
+    for _ in range(iterations):
+        with torch.no_grad():
+            _ = model.predict(source=im, verbose=False)
+
+    for h in hooks:
+        h.remove()
+
+    # —— Aggregate & print full table —————————————
+    total_time = 0.0
+    results = []
+    for name, times in elapsed.items():
+        avg = sum(times) / len(times)
+        total_time += avg
+        results.append({"layer": name, "time_ms": avg})
+
+    # Summary
+    print(f"\n*** Layer-by-layer summary (batch={batch_size}) ***")
+    print(f"  Total time: {total_time:.2f} ms   —→ {1000/total_time:.2f} FPS\n")
+
+    # Full detailed table
+    print(f"{'Layer':<20}{'Time (ms)':>10}")
+    print("-" * 30)
+    for r in results:
+        print(f"{r['layer']:<20}{r['time_ms']:>10.2f}")
+    print("-" * 30)
+
+    return {
+        "model": model.model_name,
+        "batch_size": batch_size,
+        "layers": results,
+        "total_time_ms": total_time,
+        "fps": 1000 / total_time
+    }
 
 
-        
-        # Timed runs
-        total_times = []
-        for _ in tqdm(range(self.num_timed_runs), desc=f"Profiling {model_type} model"):
-            # Clear cache before each run
-            if self.device != 'cpu':
-                torch.cuda.empty_cache()
-            gc.collect()
-            
-            # Time full model
-            start = time.perf_counter()
-            with torch.no_grad():
-                model(self.input_data, verbose=False)
-            end = time.perf_counter()
-            total_times.append((end - start) * 1000)  # ms
-        
-        # Remove hooks and restore original forward methods
-        for i, layer in enumerate(layers):
-            hooks[i].remove()
-            delattr(layer, 'forward_original')
-        
-        # Process results
-        results['total_time'] = np.mean(total_times)
-        results['total_std'] = np.std(total_times)
-        
-        for name in layer_times:
-            results['layer_times'][name] = np.mean(layer_times[name])
-            if name in layer_memory:
-                results['layer_memory'][name] = np.mean(layer_memory[name])
-        
-        # Calculate parameters
-        results['params'] = sum([p.numel() for p in model.parameters() if p.requires_grad])
-        
-        return results
+def iterative_sigma_clipping(data, sigma=2, max_iters=3):
+    """Applies iterative sigma clipping to data to remove outliers."""
+    data = np.array(data)
+    for _ in range(max_iters):
+        mu, std = data.mean(), data.std()
+        clipped = data[(data > mu - sigma * std) & (data < mu + sigma * std)]
+        if len(clipped) == len(data):
+            break
+        data = clipped
+    return data
+# Example usage when script is run directly
+if __name__ == "__main__":
+    import argparse
     
-    def profile(self):
-        """Run full profiling on both models."""
-        print("\n--- Starting profiling ---")
-        
-        # Profile quaternion model
-        q_results = self.measure_layer_performance(self.q_model, 'quaternion')
-        
-        # Profile regular model if available
-        if self.regular_model:
-            reg_results = self.measure_layer_performance(self.regular_model, 'regular')
-        
-        return self.results
-    
-    def compare_results(self):
-        """Compare results between quaternion and regular models."""
-        if not self.regular_model:
-            print("No regular model provided for comparison.")
-            return self.results['quaternion']
-        
-        q_results = self.results['quaternion']
-        reg_results = self.results['regular']
-        
-        comparison = {
-            'total_time_ratio': q_results['total_time'] / reg_results['total_time'],
-            'params_ratio': q_results['params'] / reg_results['params'],
-            'layer_time_ratios': {}
-        }
-        
-        # Find common layers
-        q_layers = set(q_results['layer_times'].keys())
-        reg_layers = set(reg_results['layer_times'].keys())
-        common_layers = q_layers.intersection(reg_layers)
-        
-        for layer in common_layers:
-            q_time = q_results['layer_times'][layer]
-            reg_time = reg_results['layer_times'][layer]
-            comparison['layer_time_ratios'][layer] = q_time / reg_time
-        
-        return comparison
-    
-    def print_summary(self):
-        """Print a summary of profiling results."""
-        q_results = self.results['quaternion']
-        
-        print("\n--- Quaternion Model Summary ---")
-        print(f"Total inference time: {q_results['total_time']:.2f} ± {q_results.get('total_std', 0):.2f} ms")
-        print(f"Parameters: {q_results['params']:,}")
-        
-        print("\nTop 5 slowest layers:")
-        layers_by_time = sorted(q_results['layer_times'].items(), key=lambda x: x[1], reverse=True)
-        for name, time in layers_by_time[:5]:
-            print(f"  {name}: {time:.2f} ms")
-        
-        if self.regular_model:
-            reg_results = self.results['regular']
-            comparison = self.compare_results()
-            
-            print("\n--- Regular Model Summary ---")
-            print(f"Total inference time: {reg_results['total_time']:.2f} ± {reg_results.get('total_std', 0):.2f} ms")
-            print(f"Parameters: {reg_results['params']:,}")
-            
-            print("\n--- Comparison ---")
-            print(f"Speed ratio (Q/Reg): {comparison['total_time_ratio']:.2f}x")
-            print(f"Parameter ratio (Q/Reg): {comparison['params_ratio']:.2f}x")
-            
-            if comparison['total_time_ratio'] < 1:
-                print(f"Quaternion model is {1/comparison['total_time_ratio']:.2f}x faster")
-            else:
-                print(f"Regular model is {comparison['total_time_ratio']:.2f}x faster")
-    
-    def plot_results(self, save_path=None):
-        """
-        Plot comparison results.
-        
-        Args:
-            save_path (str, optional): Path to save plots
-        """
-        if not self.regular_model:
-            print("No regular model provided for visualization.")
-            return
-        
-        # 1. Overall time comparison
-        fig, ax = plt.subplots(figsize=(10, 6))
-        models = ['Quaternion', 'Regular']
-        times = [
-            self.results['quaternion']['total_time'],
-            self.results['regular']['total_time']
-        ]
-        bars = ax.bar(models, times, color=['blue', 'orange'])
-        ax.set_ylabel('Inference Time (ms)')
-        ax.set_title('Model Inference Time Comparison')
-        
-        # Add time values on top of bars
-        for bar, time in zip(bars, times):
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                    f'{time:.2f} ms', ha='center', va='bottom')
-            
-        if save_path:
-            plt.savefig(f"{save_path}_time_comparison.png", dpi=300, bbox_inches='tight')
-        
-        # 2. Layer-by-layer comparison
-        q_layers = self.results['quaternion']['layer_times']
-        reg_layers = self.results['regular']['layer_times']
-        
-        # Find common layers
-        common_layers = set(q_layers.keys()).intersection(set(reg_layers.keys()))
-        
-        if common_layers:
-            # Sort layers by regular model time
-            sorted_layers = sorted(common_layers, key=lambda x: reg_layers[x], reverse=True)
-            top_n = min(10, len(sorted_layers))  # Show top 10 layers or fewer
-            
-            fig, ax = plt.subplots(figsize=(12, 8))
-            
-            x = np.arange(top_n)
-            width = 0.35
-            
-            layer_names = [layer.split('_')[0] for layer in sorted_layers[:top_n]]
-            q_times = [q_layers[layer] for layer in sorted_layers[:top_n]]
-            r_times = [reg_layers[layer] for layer in sorted_layers[:top_n]]
-            
-            ax.bar(x - width/2, q_times, width, label='Quaternion')
-            ax.bar(x + width/2, r_times, width, label='Regular')
-            
-            ax.set_ylabel('Time (ms)')
-            ax.set_title('Layer-wise Inference Time Comparison')
-            ax.set_xticks(x)
-            ax.set_xticklabels(layer_names, rotation=45, ha='right')
-            ax.legend()
-            
-            plt.tight_layout()
-            if save_path:
-                plt.savefig(f"{save_path}_layer_comparison.png", dpi=300, bbox_inches='tight')
-        
-        plt.show()
-    
-    def export_results(self, output_path=None):
-        """
-        Export profiling results to CSV.
-        
-        Args:
-            output_path (str, optional): Path to save CSV file
-        """
-        if output_path is None:
-            output_path = "model_profiling_results.csv"
-        
-        # Prepare data for DataFrame
-        data = []
-        q_results = self.results['quaternion']
-        
-        # Quaternion model results
-        for layer_name, time in q_results['layer_times'].items():
-            memory = q_results['layer_memory'].get(layer_name, 0)
-            data.append({
-                'model_type': 'quaternion',
-                'layer_name': layer_name,
-                'time_ms': time,
-                'memory_mb': memory
-            })
-        
-        # Regular model results if available
-        if self.regular_model:
-            reg_results = self.results['regular']
-            for layer_name, time in reg_results['layer_times'].items():
-                memory = reg_results['layer_memory'].get(layer_name, 0)
-                data.append({
-                    'model_type': 'regular',
-                    'layer_name': layer_name,
-                    'time_ms': time,
-                    'memory_mb': memory
-                })
-        
-        # Create DataFrame and save
-        df = pd.DataFrame(data)
-        df.to_csv(output_path, index=False)
-        print(f"Results exported to {output_path}")
-        
-        # Also save summary
-        summary_data = {
-            'quaternion': {
-                'total_time_ms': q_results['total_time'],
-                'total_std_ms': q_results.get('total_std', 0),
-                'params': q_results['params']
-            }
-        }
-        
-        if self.regular_model:
-            reg_results = self.results['regular']
-            summary_data['regular'] = {
-                'total_time_ms': reg_results['total_time'],
-                'total_std_ms': reg_results.get('total_std', 0),
-                'params': reg_results['params']
-            }
-            
-            comparison = self.compare_results()
-            summary_data['comparison'] = {
-                'speed_ratio': comparison['total_time_ratio'],
-                'params_ratio': comparison['params_ratio']
-            }
-        
-        summary_df = pd.DataFrame.from_dict(summary_data, orient='index')
-        summary_output = output_path.replace('.csv', '_summary.csv')
-        summary_df.to_csv(summary_output)
-        print(f"Summary exported to {summary_output}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Profile Quaternion and Regular YOLO models')
-    parser.add_argument('--q_model', type=str, required=True, help='Path to quaternion model')
-    parser.add_argument('--reg_model', type=str, default=None, help='Path to regular model for comparison')
-    parser.add_argument('--imgsz', type=int, default=640, help='Image size for inference')
-    parser.add_argument('--warmup', type=int, default=10, help='Number of warmup runs')
-    parser.add_argument('--runs', type=int, default=100, help='Number of timed runs')
-    parser.add_argument('--device', type=str, default=None, help='Device to run on (cpu, 0, 1, etc.)')
-    parser.add_argument('--output', type=str, default='profiling_results', help='Output filename prefix')
+    parser = argparse.ArgumentParser(description="Advanced benchmarking for YOLO models")
+    parser.add_argument('--model', type=str, default='runs/detect/train212/weights/best.pt', help='Model path or name')
+    parser.add_argument('--data', type=str, default='C:/Users/bag100/ultralytics/ultralytics/cfg/datasets/aism2.yaml', help='Dataset path (yaml or image)')
+    parser.add_argument('--imgsz', type=int, default=640, help='Image size')
+    parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
+    parser.add_argument('--device', type=str, default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--iterations', type=int, default=100, help='Number of benchmark iterations')
+    parser.add_argument('--warmup', type=int, default=25, help='Number of warmup iterations')
+    parser.add_argument('--half', action='store_true', help='Use half precision (FP16)')
+    parser.add_argument('--profile-layers', action='store_true', help='Profile individual layers')
+    parser.add_argument('--verbose', action='store_true', help='Verbose output')
     args = parser.parse_args()
     
-    profiler = ModelProfiler(
-        q_model_path=args.q_model,
-        regular_model_path=args.reg_model,
-        imgsz=args.imgsz,
-        num_warmup_runs=args.warmup,
-        num_timed_runs=args.runs,
-        device=args.device
-    )
-    
-    results = profiler.profile()
-    profiler.print_summary()
-    profiler.plot_results(save_path=args.output)
-    profiler.export_results(output_path=f"{args.output}.csv")
-
-
-if __name__ == "__main__":
-    main()
-
-
-# Example 2: Compare quaternion model against a regular model
-# python quaternion_profiler.py --q_model yolov8q.pt --reg_model yolov8n.pt --imgsz 640 --runs 50 --device 0
+    if args.profile_layers:
+        profile_layers(
+            model=args.model,
+            data=args.data,
+            imgsz=args.imgsz,
+            device=args.device,
+            batch_size=args.batch_size,
+            iterations=args.iterations // 10
+        )
+    else:
+        benchmark_pytorch(
+            model=args.model,
+            data=args.data,
+            imgsz=args.imgsz,
+            half=args.half,
+            device=args.device,
+            verbose=args.verbose,
+            batch_size=args.batch_size,
+            warmup_iterations=args.warmup,
+            benchmark_iterations=args.iterations
+        )
