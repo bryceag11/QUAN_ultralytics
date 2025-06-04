@@ -10,14 +10,13 @@ import gc
 from contextlib import contextmanager
 import sys
 
-sys.path.append('.')  # Add current directory to path
+sys.path.append('.') 
 from ultralytics import YOLO
 
 
 class LayerProfiler:
     """
-    A more detailed profiler focused on specific layer types in the model backbone.
-    This version provides more granular analysis of quaternion vs regular layers.
+    A more detailed profiler focused on specific layer types in the model backbone
     """
     
     def __init__(self, 
@@ -549,8 +548,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# Example 1: Focus on quaternion vs standard convolution layers
-# python layer_specific_profiler.py --q_model yolov8q.pt --reg_model yolov8n.pt --layer_types Conv QConv DWConv --runs 30
-

@@ -50,7 +50,7 @@ except:
     print("Failed to import compiled quaternion_ops. Falling back to Pytorch implementation")
     CUDA_EXT = False
 
-def autopad(k, p=None, d=1):  # kernel, padding, dilation
+def autopad(k, p=None, d=1): 
     """Pad to 'same' shape outputs."""
     if d > 1:
         k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]  # actual kernel-size
@@ -68,7 +68,7 @@ class QConv2D(nn.Module):
                  dilation: Union[int, Tuple[int, int]] = 1,
                  groups: int = 1,
                  bias: bool = True,
-                 padding_mode: str = 'zeros', # Note: padding_mode not used by CUDA kernel
+                 padding_mode: str = 'zeros', 
                  dtype=None,
                  mapping_type: str='poincare'):
         super().__init__()
@@ -80,8 +80,7 @@ class QConv2D(nn.Module):
 
         # Handle autopad for padding
         if padding == 'same':
-            # For 'same' padding with stride=1, we need to ensure output size equals input size
-            # The correct padding for 'same' is: padding = (kernel_size - 1) // 2 when stride=1
+            # For same: padding = (kernel_size - 1) // 2 when stride=1
             if stride == (1, 1):
                 padding = ((kernel_size[0] - 1) // 2, (kernel_size[1] - 1) // 2)
             else:
@@ -109,7 +108,7 @@ class QConv2D(nn.Module):
 
         self.is_first_layer = (in_channels == 3)
         if self.is_first_layer:
-            self.in_channels_per_comp = 1 # Input C per component is 1 after mapping
+            self.in_channels_per_comp = 1 
         else:
             assert in_channels % 4 == 0, "in_channels must be multiple of 4 for non-first layers"
             self.in_channels_per_comp = in_channels // 4
@@ -120,8 +119,9 @@ class QConv2D(nn.Module):
         # Input channels per component per group
         assert self.in_channels_per_comp % groups == 0, "Input channels per component must be divisible by groups"
         self.in_channels_per_comp_grp = self.in_channels_per_comp // groups
+        
         self.bias_flag_overall = bias
-        # --- Define 4 weight Parameters ---
+        
         weight_shape = (
             self.out_channels_per_comp,
             self.in_channels_per_comp_grp,
@@ -132,7 +132,6 @@ class QConv2D(nn.Module):
         self.weight_j = nn.Parameter(torch.zeros(weight_shape))
         self.weight_k = nn.Parameter(torch.zeros(weight_shape))
 
-        # --- Define 4 bias Parameters (or None) ---
         if bias:
             bias_shape = (self.out_channels_per_comp,)
             self.bias_r = nn.Parameter(torch.zeros(bias_shape))
@@ -142,21 +141,20 @@ class QConv2D(nn.Module):
         self.register_parameter('bias_j', None)
         self.register_parameter('bias_k', None)
 
-        self._initialize_weights() # Call your existing init (needs adaptation)
+        self._initialize_weights() 
 
 
-# In your QConv2D class (within conv.py)
 
     def _initialize_weights(self):
         kernel_prod = np.prod(self.kernel_size)
-        # fan_in_component is for one of the r, i, j, or k weight matrices
+        # For one of the r, i, j, or k weight matrices
         fan_in_component = self.in_channels_per_comp_grp * kernel_prod
 
         scale_factors_map = {
             'luminance': [1.0, 1.0, 1.0, 1.0],
             'mean_brightness': [1.0, 0.75, 0.75, 0.75],
             'raw_normalized': [1.0, 1.0, 1.0, 1.0],
-            'hamilton': [1.0, 1.0, 1.0, 1.0], # If you use 'hamilton' as a mapping_type string
+            'hamilton': [1.0, 1.0, 1.0, 1.0], 
             'poincare': [1.0, 1.0, 1.0, 1.0]
         }
         # Default scales if self.mapping_type is not in the map
@@ -168,9 +166,8 @@ class QConv2D(nn.Module):
             # Initialize weights using scaled 'a' for kaiming_uniform_
             nn.init.kaiming_uniform_(weight_param, a=math.sqrt(5.0) * scales[i])
 
-        # Only initialize self.bias_r if it was created (i.e., self.bias_flag_overall was True)
+        # Only initialize self.bias_r if it was created 
         if self.bias_flag_overall and self.bias_r is not None:
-            # The 'r' component corresponds to scales[0]
             bound_r = (1 / math.sqrt(fan_in_component)) * scales[0] if fan_in_component > 0 else 0
             nn.init.uniform_(self.bias_r, -bound_r, bound_r)
 
@@ -219,7 +216,6 @@ class QConv2D(nn.Module):
             original_shape = x.shape
             if C != self.in_channels_total:
                 print(f"Warning: Input channel mismatch! Expected {self.in_channels_total}, got {C}")
-                # Decide how to handle - error or reshape based on expected?
             assert C % 4 == 0, f"Input channels {C} must be multiple of 4 for non-first layer standard input"
             x = x.view(B, C // 4, 4, H, W)
         elif x.dim() == 5: # Already in quaternion format
@@ -271,11 +267,9 @@ class QConv2D(nn.Module):
             )
             return output
         else:
-        # --- Fallback to Original Python/PyTorch implementation ---
-        # Reimplement using F.conv2d and the 4 weights/biases
-            # Input x is [B, C_in_per_q, Q=4, H_in, W_in]
-            xr, xi, xj, xk = torch.split(x, 1, dim=2) # Split along Q dim -> [B, C_in_p_q, 1, H, W]
-            xr = xr.squeeze(2) # [B, C_in_p_q, H, W]
+            # Pytorch fallback
+            xr, xi, xj, xk = torch.split(x, 1, dim=2) 
+            xr = xr.squeeze(2) 
             xi = xi.squeeze(2)
             xj = xj.squeeze(2)
             xk = xk.squeeze(2)
@@ -299,9 +293,6 @@ class QConv2D(nn.Module):
 class IQBN(nn.Module):
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
         super().__init__()
-        # Ensure num_features is the total count (including Q=4)
-        # The C++ code expects gamma/beta/running_stats to be shaped [C, Q]
-        # where C = num_features / 4
         actual_features = num_features // 4
         assert num_features % 4 == 0, "num_features must be a multiple of 4 for IQBN"
         self.num_features = actual_features # Store the C part
@@ -309,12 +300,11 @@ class IQBN(nn.Module):
         self.eps = eps
         self.momentum = momentum
 
-        # Parameters should match the expected shape [C, Q] or [C*Q]
-        # Let's use [C, Q] for clarity matching the CUDA kernel access
+
         self.gamma = nn.Parameter(torch.ones(self.num_features, 4))
         self.beta = nn.Parameter(torch.zeros(self.num_features, 4))
 
-        # Running stats with correct shapes [C, Q]
+        # Running stats with shapes [C, Q]
         self.register_buffer('running_mean', torch.zeros(self.num_features, 4))
         self.register_buffer('running_var', torch.ones(self.num_features, 4))
         self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
@@ -332,9 +322,8 @@ class IQBN(nn.Module):
         running_mean = self.running_mean.to(dtype=input_dtype)
         running_var = self.running_var.to(dtype=input_dtype)
         if not self.training or not CUDA_EXT:
-            # Use CUDA extension for inference OR if fallback is needed
+            # Use CUDA extension for inference OR if fallback 
             if CUDA_EXT and not self.training and x.is_cuda:
-                 # Ensure tensors are contiguous and on the correct device
                  x = x.contiguous()
                  gamma = self.gamma.contiguous()
                  beta = self.beta.contiguous()
@@ -342,7 +331,7 @@ class IQBN(nn.Module):
                  running_var = self.running_var.contiguous()
                  return quaternion_ops.iqbn_forward(x, gamma, beta, running_mean, running_var, self.eps)
             else:
-                # Fallback to PyTorch inference implementation (or if training and CUDA not available)
+                # Pytorch fallback
                 mean = self.running_mean.view(1, self.num_features, 4, 1, 1)
                 var = self.running_var.view(1, self.num_features, 4, 1, 1)
                 gamma_view = self.gamma.view(1, self.num_features, 4, 1, 1)
@@ -350,18 +339,14 @@ class IQBN(nn.Module):
                 x_norm = (x - mean) / torch.sqrt(var + self.eps)
                 return x_norm * gamma_view + beta_view
         else:
-            # --- Training path (using PyTorch implementation) ---
-            # Keep your existing PyTorch training logic here.
-            # The CUDA kernel doesn't compute batch statistics.
-            # Example (adapt from your original code if different):
-            x_flat = x.permute(0, 2, 1, 3, 4).contiguous().view(B * Q, C, H * W) # Treat Q as batch dim for stats
-            mean = x_flat.mean(dim=[0, 2]) # Mean over B*Q and HW -> shape [C] - IS THIS CORRECT? Check BN logic.
-                                           # Original IQBN calculated stats per [C, Q]
-                                           # Let's recalculate stats per [C, Q] like the inference path expects
+            # Training path
+
+            x_flat = x.permute(0, 2, 1, 3, 4).contiguous().view(B * Q, C, H * W) 
+            mean = x_flat.mean(dim=[0, 2]) 
 
             # Calculate batch stats per (C, Q)
-            mean_batch = x.mean(dim=[0, 3, 4]) # Shape [C, Q]
-            var_batch = x.var(dim=[0, 3, 4], unbiased=False) + 1e-8 # Shape [C, Q]
+            mean_batch = x.mean(dim=[0, 3, 4]) # [C, Q]
+            var_batch = x.var(dim=[0, 3, 4], unbiased=False) + 1e-8 # [C, Q]
 
             # Update running stats
             with torch.no_grad():
@@ -369,7 +354,7 @@ class IQBN(nn.Module):
                 self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var_batch
                 self.num_batches_tracked += 1
 
-            # Normalize using batch statistics
+            # Normalize w/batch statistics
             x_norm = (x - mean_batch.view(1, C, Q, 1, 1)) / torch.sqrt(var_batch.view(1, C, Q, 1, 1) + self.eps)
 
             # Apply affine parameters
@@ -377,74 +362,22 @@ class IQBN(nn.Module):
             beta_view = self.beta.view(1, C, Q, 1, 1)
             return x_norm * gamma_view + beta_view
 
-
-
-class OGIQBN(nn.Module):
-    # OG Independent Quaternion Batch Norm
-    def __init__(self, num_features, eps=1e-5, momentum=0.1):
-        super().__init__()
-        self.num_features = num_features // 4
-        self.eps = eps
-        self.momentum = momentum
-        
-        # Parameters for correct broadcasting
-        self.gamma = nn.Parameter(torch.ones(self.num_features, 4))
-        self.beta = nn.Parameter(torch.zeros(self.num_features, 4))
-        
-        # Running stats with correct shapes
-        self.register_buffer('running_mean', torch.zeros(self.num_features, 4))
-        self.register_buffer('running_var', torch.ones(self.num_features, 4))
-
-    def forward(self, x):
-        # Quick shape check
-        B, C, Q, H, W = x.shape
-        
-        if not self.training:
-            # Faster evaluation using pre-computed stats
-            mean = self.running_mean.view(1, self.num_features, 4, 1, 1)
-            var = self.running_var.view(1, self.num_features, 4, 1, 1)
-            x_norm = (x - mean) / torch.sqrt(var + self.eps)
-            return x_norm * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
-        
-        # Training mode optimized
-        # Batch statistics - process all spatial dimensions at once for efficiency
-        x_flat = x.reshape(B, C, Q, -1)
-        mean = x_flat.mean(dim=[0, 3], keepdim=True)  # [1, C, Q, 1]
-        var = x_flat.var(dim=[0, 3], keepdim=True, unbiased=False) + 1e-8  # Added eps for stability
-        
-        # Update running stats
-        with torch.no_grad():
-            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean.squeeze()
-            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var.squeeze()
-        
-        # Normalize
-        x_norm = (x - mean.view(1, C, Q, 1, 1)) / torch.sqrt(var.view(1, C, Q, 1, 1) + self.eps)
-        
-        # Apply affine parameters
-        return x_norm * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
-
-
 class IQLN(nn.Module):
     def __init__(self, num_features, eps=1e-5, elementwise_affine=True):
         super().__init__()
-        # Standard LayerNorm
         self.ln = nn.LayerNorm(num_features, eps=eps, elementwise_affine=elementwise_affine)
         
     def forward(self, x):
         # x shape: [B, C, 4, H, W]
         B, C, Q, H, W = x.shape
         
-        # Reshape to put all except batch dimension together for LayerNorm
-        # LayerNorm expects shape [B, *] where * are the normalized dimensions
         x_reshaped = x.permute(0, 3, 4, 1, 2).reshape(B, H*W, C*Q)
-        
-        # Apply layer norm
         x_ln = self.ln(x_reshaped)
         
         # Reshape back to [B, C, 4, H, W]
         return x_ln.reshape(B, H, W, C, Q).permute(0, 3, 4, 1, 2)
 
-
+# Deprecated class
 class QConv(nn.Module):
     """
     Base Quaternion Convolution class.
@@ -471,7 +404,6 @@ class QConv(nn.Module):
         assert mapping_type in valid_mappings, f"Invalid mapping type. Choose from {valid_mappings}"
         
         self.mapping_type = mapping_type
-        # Special handling for first layer
 
         self.rank = rank
         self.in_channels = in_channels
@@ -480,7 +412,6 @@ class QConv(nn.Module):
         self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size,) * rank
         
         self.mapping_type = mapping_type
-        # Define the underlying real-valued convolution for each quaternion component
         if rank == 1:
             Conv = nn.Conv1d
         elif rank == 2:
@@ -490,14 +421,13 @@ class QConv(nn.Module):
             
         self.is_first_layer = (in_channels == 3) 
         if self.is_first_layer:
-            # For RGB input, map to 4 channels
+            # RGB input maps to 4 channels (1 quat channel)
             actual_in_channels = 1  
         else:
             assert in_channels % 4 == 0, "in_channels must be multiple of 4 for non-first layers"
             actual_in_channels = in_channels // 4
         assert out_channels % 4 == 0, "out_channels must be multiple of 4"
         
-        # For first layer, use in_channels=1, for others use in_channels//4
         out_channels_quat = out_channels // 4
         
         self.conv_r = Conv(actual_in_channels, out_channels_quat, kernel_size,
@@ -521,18 +451,17 @@ class QConv(nn.Module):
 
 
 
-    # Bias for all layers weight init
     def _initialize_weights(self):
         
         kernel_prod = np.prod(self.kernel_size)
         fan_in = (self.in_channels // 4 if not self.is_first_layer else 1) * kernel_prod
         
-        # Scale factors for quaternion components
+        # Scale factors 
         scale_factors = {
-            'luminance': [1.0, 1.0, 1.0, 1.0],      # Emphasize real component
-            'mean_brightness': [1.0, 0.75, 0.75, 0.75],  # Slightly more balanced
-            'raw_normalized': [1.0, 1.0, 1.0, 1.0],  # Equal emphasis
-            'poincare': [1.0, 1.0, 1.0, 1.0]  # Equal emphasis
+            'luminance': [1.0, 1.0, 1.0, 1.0], 
+            'mean_brightness': [1.0, 0.75, 0.75, 0.75],  
+            'raw_normalized': [1.0, 1.0, 1.0, 1.0],  
+            'poincare': [1.0, 1.0, 1.0, 1.0]  
 
         }
         scales = scale_factors.get(self.mapping_type, [0.5, 0.5, 0.5, 0.5])
@@ -551,11 +480,10 @@ class QConv(nn.Module):
                 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Handle RGB input
-        if x.size(1) == 3:  # RGB input
+        if x.size(1) == 3:
             x = self.rgb_to_quaternion(x)
             
         if self.is_first_layer:
-            # Process first layer more efficiently
             B, Q, H, W = x.shape
             # Stack components for single batch processing
             x_stacked = x.reshape(B*Q, 1, H, W)
@@ -564,19 +492,18 @@ class QConv(nn.Module):
             j_conv = self.conv_j(x_stacked.view(B, Q, H, W)[:, 2:3])
             k_conv = self.conv_k(x_stacked.view(B, Q, H, W)[:, 3:4])
         else:
-            # For subsequent layers, use channel-wise processing
+            # Channel-wise
             x_r = x[:, :, 0, :, :]
             x_i = x[:, :, 1, :, :]
             x_j = x[:, :, 2, :, :]
             x_k = x[:, :, 3, :, :]
             
-            # Process in parallel if possible
             r_conv = self.conv_r(x_r)
             i_conv = self.conv_i(x_i)
             j_conv = self.conv_j(x_j)
             k_conv = self.conv_k(x_k)
         
-        # Use in-place operations and fuse calculations where possible
+        # In-place operations
         out_r = r_conv
         out_r.add_(i_conv).add_(j_conv).add_(k_conv)
         
@@ -589,10 +516,10 @@ class QConv(nn.Module):
         out_k = - r_conv.clone()
         out_k.add_(i_conv).sub_(j_conv).add_(k_conv)
         
-        # Stack outputs efficiently
+        # Stack outputs
         out = torch.stack([out_r, out_i, out_j, out_k], dim=2)
         
-        # Clean up intermediate tensors to save memory
+        # Clean up intermediate tensors
         del r_conv, i_conv, j_conv, k_conv
         
         return out
@@ -625,34 +552,7 @@ class QConv(nn.Module):
         return mappings[self.mapping_type]
 
 
-# # class QConv2D(QConv):
-#     """2D Quaternion Convolution layer."""
-#     def __init__(self,
-#                  in_channels: int,
-#                  out_channels: int,
-#                  kernel_size: Union[int, Tuple[int, int]],
-#                  stride: Union[int, Tuple[int, int]] = 1,
-#                  padding: Union[str, int, Tuple[int, int]] = 0,
-#                  dilation: Union[int, Tuple[int, int]] = 1,
-#                  groups: int = 1,
-#                  bias: bool = True,
-#                  padding_mode: str = 'zeros',
-#                  dtype=None,
-#                  mapping_type: str='poincare') -> None:
-#         super().__init__(
-#             rank=2,  # Fixed for 2D convolution
-#             in_channels=in_channels,
-#             out_channels=out_channels,
-#             kernel_size=kernel_size,
-#             stride=stride,
-#             padding=padding,
-#             dilation=dilation,
-#             groups=groups,
-#             bias=bias,
-#             padding_mode=padding_mode,
-#             dtype=dtype,
-#             mapping_type=mapping_type
-#         )
+
 
 # Conv using quaternion conv
 class Conv(nn.Module):
@@ -686,6 +586,7 @@ class Conv(nn.Module):
         out = self.act(out)
         return out
 
+# Conv using real-valued
 # class Conv(nn.Module):
 #     """
 #     Standard convolution module with batch normalization and activation.

@@ -65,7 +65,6 @@ def benchmark_pytorch(
         print(f"Benchmarking {model_name} on {device} device")
     total_params = sum(p.numel() for p in model.model.parameters())
     print(f"Total parameters: {total_params/1e6:.2f}M")
-    # Determine if we should use a dataset or zeros
     use_dataset = False
     if data:
         if verbose:
@@ -188,18 +187,16 @@ def benchmark_pytorch(
 
 def profile_layers(
     model="runs/detect/mar_aism_exps/train77/weights/best.pt",
-    data=None,               # Path to your dataset YAML or a single image
+    data=None, 
     imgsz=640,
     device="cuda",
     batch_size=1,
     iterations=10
 ):
     """
-    Profile each layer of a YOLO model for performance analysis using PyTorch hooks.
-    Always prints a full layer-by-layer table and summary.
+    Profile each layer of a YOLO model for performance analysis using PyTorch hooks
     """
 
-    # —— Setup device and model —————————————
     device = select_device(device, verbose=False)
     if isinstance(model, (str, Path)):
         model = YOLO(model)
@@ -208,7 +205,7 @@ def profile_layers(
 
     img_size = (imgsz, imgsz) if isinstance(imgsz, int) else tuple(imgsz)
 
-    # —— Build input batch —————————————
+    # Input batch 
     def load_from_yaml(yaml_path):
         cfg = yaml.safe_load(Path(yaml_path).read_text())
         root = Path(cfg.get('path', Path(yaml_path).parent))
@@ -248,7 +245,7 @@ def profile_layers(
         print(f"No valid data input, using zero tensor of shape ({batch_size},3,{imgsz},{imgsz})")
         im = torch.zeros(batch_size, 3, *img_size, device=device)
 
-    # —— Profiling hooks —————————————
+    # Profiling hooks 
     def time_sync():
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -269,7 +266,7 @@ def profile_layers(
             del m._t0
         hooks.append(layer.register_forward_hook(post_hook))
 
-    # —— Warm‑up & timed runs —————————————
+    # Warm-up & timed runs
     with torch.no_grad():
         _ = model.predict(source=im, verbose=False)
     for _ in range(iterations):
@@ -279,7 +276,7 @@ def profile_layers(
     for h in hooks:
         h.remove()
 
-    # —— Aggregate & print full table —————————————
+    # Table aggregation
     total_time = 0.0
     results = []
     for name, times in elapsed.items():

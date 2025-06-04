@@ -2,7 +2,6 @@
 #include <torch/extension.h>
 #include <vector>
 
-// Forward declarations for CUDA functions
 torch::Tensor qconv_forward_cuda(
     torch::Tensor input,
     torch::Tensor weight_r,
@@ -45,7 +44,7 @@ torch::Tensor iqbn_forward_cuda(
     torch::Tensor running_var,
     float eps);
 
-// Keep original forward wrapper
+
 torch::Tensor qconv_forward(
     torch::Tensor input,
     torch::Tensor weight_r,
@@ -87,7 +86,6 @@ torch::Tensor qconv_forward(
 }
 
 
-// New optimized backward wrapper
 std::vector<torch::Tensor> qconv_backward(
     torch::Tensor grad_output,
     torch::Tensor input,

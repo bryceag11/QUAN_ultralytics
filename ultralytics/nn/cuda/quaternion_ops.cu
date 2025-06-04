@@ -34,7 +34,7 @@ __global__ void iqbn_forward_kernel(
     const scalar_t inp = input[index];
     output[index] = gamma_val * (inp - mean) / sqrt(var + eps) + beta_val;
 }
-// Fixed forward kernel - removed unused stride variables
+
 
 template <typename scalar_t>
 __global__ void qconv_forward_kernel_hamilton(
@@ -142,7 +142,7 @@ __global__ void qconv_forward_kernel_hamilton(
     output[base_offset_out + 3 * (H_out * W_out)] = static_cast<scalar_t>(final_k_acc);
 }
 
-// Optimized backward input kernel - no shared memory, better coalescing
+
 template <typename scalar_t>
 __global__ void qconv_backward_input_kernel(
     scalar_t* __restrict__ grad_input,
@@ -243,7 +243,6 @@ __global__ void qconv_backward_input_kernel(
         }
     }
     
-    // Write results - coalesced access
     const int input_base = ((batch * C_in_per_q + c_in) * Q) * H_in * W_in;
     const int input_offset = h_in * W_in + w_in;
     
@@ -253,7 +252,6 @@ __global__ void qconv_backward_input_kernel(
     grad_input[input_base + 3 * H_in * W_in + input_offset] = static_cast<scalar_t>(grad_xk);
 }
 
-// Highly optimized weight gradient kernel using warp-level primitives
 template <typename scalar_t>
 __global__ void qconv_backward_weight_kernel(
     scalar_t* __restrict__ grad_weight_r,
@@ -352,7 +350,7 @@ __global__ void qconv_backward_weight_kernel(
     }
     
     // Block-level reduction using shared memory
-    __shared__ acc_scalar_t shared_grads[4][32]; // Max 32 warps per block
+    __shared__ acc_scalar_t shared_grads[4][32];
     
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
@@ -389,7 +387,6 @@ __global__ void qconv_backward_weight_kernel(
     }
 }
 
-// Simple and efficient bias gradient kernel
 template <typename scalar_t>
 __global__ void qconv_backward_bias_kernel(
     scalar_t* __restrict__ grad_bias,
@@ -446,7 +443,6 @@ __global__ void qconv_backward_bias_kernel(
     }
 }
 
-// Optimized backward function
 std::vector<torch::Tensor> qconv_backward_cuda(
     torch::Tensor grad_output,
     torch::Tensor input,
@@ -489,7 +485,7 @@ std::vector<torch::Tensor> qconv_backward_cuda(
     weight_j = weight_j.contiguous();
     weight_k = weight_k.contiguous();
     
-    // 1. Backward input - process all input elements
+    // Backward input
     {
         const int threads = 256;
         const int total_input_elements = B * C_in_per_q * H_in * W_in;
@@ -510,7 +506,7 @@ std::vector<torch::Tensor> qconv_backward_cuda(
         }));
     }
     
-    // 2. Backward weight - one block per weight
+    // Backward weight has one block per weight
     {
         const int threads = 256;
         const int total_weights = C_out_per_q * C_in_per_q_grp * kH * kW;
@@ -531,7 +527,7 @@ std::vector<torch::Tensor> qconv_backward_cuda(
         }));
     }
     
-    // 3. Backward bias - one block per output channel
+    // Backward bias has one block per output channel
     if (bias_defined) {
         const int threads = 256;
         const int blocks = C_out_per_q;
@@ -550,7 +546,7 @@ std::vector<torch::Tensor> qconv_backward_cuda(
 
 
 
-// --- CUDA function implementations ---
+
 torch::Tensor iqbn_forward_cuda(
     torch::Tensor input,        // [B, C_per_q, Q, H, W]
     torch::Tensor gamma,        // [C_per_q, Q]
@@ -585,7 +581,6 @@ torch::Tensor iqbn_forward_cuda(
     const int total_elements = N * C_per_q * Q * HW;
     const int blocks = (total_elements + threads - 1) / threads;
 
-    // Ensure tensors are contiguous for direct data pointer access in kernel
     input = input.contiguous();
     gamma = gamma.contiguous();
     beta = beta.contiguous();
@@ -608,7 +603,6 @@ torch::Tensor iqbn_forward_cuda(
     return output;
 }
 
-// --- Updated qconv_forward_cuda to accept 4 weights/biases ---
 torch::Tensor qconv_forward_cuda(
     torch::Tensor input,        // [B, C_in_per_q, Q=4, H_in, W_in]
     torch::Tensor weight_r,     // [C_out_per_q, C_in_per_q_grp, kH, kW]
@@ -636,8 +630,8 @@ torch::Tensor qconv_forward_cuda(
     const auto H_in = input.size(3);
     const auto W_in = input.size(4);
 
-    const auto C_out_per_q = weight_r.size(0); // Output channels per component
-    const auto C_in_per_q_grp = weight_r.size(1); // Input channels per component per group
+    const auto C_out_per_q = weight_r.size(0);
+    const auto C_in_per_q_grp = weight_r.size(1);
     const auto kH = weight_r.size(2);
     const auto kW = weight_r.size(3);
 
@@ -658,15 +652,13 @@ torch::Tensor qconv_forward_cuda(
     const auto H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) / stride[0] + 1;
     const auto W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) / stride[1] + 1;
 
-    // Output shape: [B, C_out_per_q, Q=4, H_out, W_out]
-    auto output = torch::empty({B, C_out_per_q, 4, H_out, W_out}, input.options());
+    auto output = torch::empty({B, C_out_per_q, 4, H_out, W_out}, input.options());     // [B, C_out_per_q, Q=4, H_out, W_out]
 
-    // Optimized launch parameters using 1D thread blocks
-    const int threads = 256; // Adjust based on GPU architecture if needed
+
+    const int threads = 256; // Adjust based on arch
     const int total_output_quaternions = B * C_out_per_q * H_out * W_out;
     const int blocks = (total_output_quaternions + threads - 1) / threads;
 
-    // Ensure contiguous inputs for direct data pointer access
     input = input.contiguous();
     weight_r = weight_r.contiguous();
     weight_i = weight_i.contiguous();
@@ -692,7 +684,7 @@ torch::Tensor qconv_forward_cuda(
             bias_k.defined() ? bias_k.data_ptr<scalar_t>() : nullptr,
             B, C_in_per_q, C_out_per_q, H_in, W_in, H_out, W_out,
             kH, kW, stride[0], stride[1], padding[0], padding[1],
-            dilation[0], dilation[1], // Pass dilation
+            dilation[0], dilation[1], 
             groups
         );
     }));
