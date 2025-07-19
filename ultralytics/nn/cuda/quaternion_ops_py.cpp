@@ -1,4 +1,4 @@
-// quaternion_ops_py_v2.cpp - Updated Python bindings
+// quaternion_ops_py.cpp - Updated Python bindings
 #include <torch/extension.h>
 #include <vector>
 
@@ -127,6 +127,8 @@ torch::Tensor iqbn_forward(
     return iqbn_forward_cuda(input, gamma, beta, running_mean, running_var, eps);
 }
 
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qconv_forward", &qconv_forward, "Quaternion Convolution Forward with Hamilton Product (CUDA)"
         , py::arg("input")
@@ -157,8 +159,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         , py::arg("dilation")
         , py::arg("groups")
     );
-    
 
     
     m.def("iqbn_forward", &iqbn_forward, "Independent Quaternion BatchNorm Forward (CUDA)");
+
+
+
+
+
 }

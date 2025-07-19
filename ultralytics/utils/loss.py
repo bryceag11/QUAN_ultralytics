@@ -1,5 +1,5 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-
+# ultralytics/utils/loss.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,7 +12,248 @@ from ultralytics.utils.torch_utils import autocast
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+class QuaternionOBBLoss(nn.Module):
+    """Combined loss for oriented object detection with quaternion representations"""
+    
+    def __init__(self, lambda1=1.0, lambda2=0.1, lambda3=0.05):
+        super().__init__()
+        self.lambda1 = lambda1  # Weight for angular loss
+        self.lambda2 = lambda2  # Weight for regularization loss
+        self.lambda3 = lambda3  # Weight for smoothness loss
+        
+    def quaternion_angular_loss(self, q_pred, q_target):
+        """
+        Compute geodesic angular distance between predicted and target quaternions.
+        Accounts for double cover property of quaternions.
+        
+        Args:
+            q_pred: Predicted quaternions [B, N, 4]
+            q_target: Target quaternions [B, N, 4]
+        """
+        # Normalize quaternions
+        q_pred = F.normalize(q_pred, p=2, dim=-1)
+        q_target = F.normalize(q_target, p=2, dim=-1)
+        
+        # Compute dot product
+        dot_product = (q_pred * q_target).sum(dim=-1)
+        
+        # Clamp to avoid numerical issues with arccos
+        dot_product = torch.clamp(dot_product, -1.0, 1.0)
+        
+        # Account for double cover: use absolute value
+        # The angle between q and -q represents the same rotation
+        angular_distance = 2 * torch.arccos(torch.abs(dot_product))
+        
+        return angular_distance.mean()
+    
+    def quaternion_regularization_loss(self, q_pred):
+        """
+        Enforce unit quaternion constraint ||q||² = 1
+        
+        Args:
+            q_pred: Predicted quaternions [B, N, 4]
+        """
+        norm_squared = (q_pred ** 2).sum(dim=-1)
+        return ((norm_squared - 1) ** 2).mean()
+    
+    def orientation_smoothness_loss(self, q_sequence):
+        """
+        Encourage temporal consistency between sequential predictions.
+        Useful for video or tracking applications.
+        
+        Args:
+            q_sequence: Sequence of quaternions [B, T, N, 4] where T is time dimension
+        """
+        if q_sequence.size(1) < 2:
+            return torch.tensor(0.0, device=q_sequence.device)
+        
+        # Normalize quaternions
+        q_sequence = F.normalize(q_sequence, p=2, dim=-1)
+        
+        # Compute angular distances between consecutive frames
+        smoothness_loss = 0.0
+        for t in range(q_sequence.size(1) - 1):
+            q_current = q_sequence[:, t]
+            q_next = q_sequence[:, t + 1]
+            
+            dot_product = (q_current * q_next).sum(dim=-1)
+            dot_product = torch.clamp(dot_product, -1.0, 1.0)
+            
+            angular_diff = torch.arccos(torch.abs(dot_product))
+            smoothness_loss += angular_diff.mean()
+        
+        return smoothness_loss / (q_sequence.size(1) - 1)
+    
+    def forward(self, predictions, targets, q_sequence=None):
+        """
+        Compute combined loss for oriented object detection.
+        
+        Args:
+            predictions: Dict containing 'cls_scores', 'bbox_preds', 'angle_preds'
+            targets: Dict containing 'cls_targets', 'bbox_targets', 'angle_targets'
+            q_sequence: Optional quaternion sequence for smoothness loss
+        """
+        # Standard detection losses (you can use existing implementations)
+        cls_loss = F.cross_entropy(predictions['cls_scores'], targets['cls_targets'])
+        bbox_loss = self.ciou_loss(predictions['bbox_preds'], targets['bbox_targets'])
+        
+        # Quaternion-specific losses
+        # Convert angle predictions to quaternions if needed
+        q_pred = self.angles_to_quaternions(predictions['angle_preds'])
+        q_target = self.angles_to_quaternions(targets['angle_targets'])
+        
+        angular_loss = self.quaternion_angular_loss(q_pred, q_target)
+        reg_loss = self.quaternion_regularization_loss(q_pred)
+        
+        # Total loss
+        total_loss = cls_loss + bbox_loss + \
+                     self.lambda1 * angular_loss + \
+                     self.lambda2 * reg_loss
+        
+        # Add smoothness loss if sequence provided
+        if q_sequence is not None:
+            smooth_loss = self.orientation_smoothness_loss(q_sequence)
+            total_loss += self.lambda3 * smooth_loss
+        
+        return total_loss, {
+            'cls_loss': cls_loss.item(),
+            'bbox_loss': bbox_loss.item(),
+            'angular_loss': angular_loss.item(),
+            'reg_loss': reg_loss.item(),
+            'smooth_loss': smooth_loss.item() if q_sequence is not None else 0.0
+        }
+    
+    def angles_to_quaternions(self, angles):
+        """Convert rotation angles to quaternions (assuming rotation around z-axis)"""
+        # For 2D rotations in image plane
+        half_angles = angles / 2
+        q_r = torch.cos(half_angles)
+        q_i = torch.zeros_like(half_angles)
+        q_j = torch.zeros_like(half_angles)
+        q_k = torch.sin(half_angles)
+        
+        return torch.stack([q_r, q_i, q_j, q_k], dim=-1)
+    
+    def ciou_loss(self, pred_boxes, target_boxes):
+        """Complete IoU loss implementation"""
+        # This is a placeholder - use your existing CIoU implementation
+        # or torchvision.ops.complete_box_iou_loss
+        return F.l1_loss(pred_boxes, target_boxes)
+
+
+# Integration with YOLO training
+class QuaternionYOLOLoss(nn.Module):
+    """YOLO loss adapted for quaternion-based oriented object detection"""
+    
+    def __init__(self, num_classes=80, lambda_weights=None):
+        super().__init__()
+        self.num_classes = num_classes
+        
+        # Default lambda weights from paper
+        if lambda_weights is None:
+            lambda_weights = {
+                'angular': 1.0,
+                'reg': 0.1, 
+                'smooth': 0.05
+            }
+        self.lambda_weights = lambda_weights
+        
+        # Initialize quaternion loss
+        self.quat_loss = QuaternionOBBLoss(
+            lambda1=lambda_weights['angular'],
+            lambda2=lambda_weights['reg'],
+            lambda3=lambda_weights['smooth']
+        )
+        
+    def forward(self, predictions, targets, images=None):
+        """
+        Args:
+            predictions: YOLO predictions including angle/quaternion outputs
+            targets: Ground truth including oriented bounding boxes
+            images: Optional images for visualization
+        """
+        device = predictions[0].device
+        batch_size = predictions[0].shape[0]
+        
+        # Initialize losses
+        total_loss = torch.tensor(0.0, device=device)
+        loss_items = {}
+        
+        # Process each detection layer
+        for i, pred in enumerate(predictions):
+            # Decode predictions based on your YOLO format
+            # This is a simplified version - adapt to your actual format
+            
+            # Extract components (adjust indices based on your implementation)
+            # Assuming format: [x, y, w, h, angle/quaternion, obj_conf, cls_probs]
+            bbox_preds = pred[..., :4]
+            angle_preds = pred[..., 4:5]  # or 4:8 for full quaternion
+            obj_preds = pred[..., 5:6]
+            cls_preds = pred[..., 6:]
+            
+            # Match predictions with targets
+            # This is simplified - use your actual target assignment logic
+            matched_targets = self.match_targets(pred, targets[i])
+            
+            # Compute individual losses
+            bbox_loss = self.bbox_loss(bbox_preds, matched_targets['boxes'])
+            obj_loss = F.binary_cross_entropy_with_logits(
+                obj_preds, matched_targets['obj_mask']
+            )
+            cls_loss = F.cross_entropy(
+                cls_preds.reshape(-1, self.num_classes),
+                matched_targets['classes'].reshape(-1)
+            )
+            
+            # Quaternion losses
+            if 'angles' in matched_targets:
+                angle_loss = self.quat_loss.quaternion_angular_loss(
+                    self.quat_loss.angles_to_quaternions(angle_preds),
+                    self.quat_loss.angles_to_quaternions(matched_targets['angles'])
+                )
+                reg_loss = self.quat_loss.quaternion_regularization_loss(
+                    self.quat_loss.angles_to_quaternions(angle_preds)
+                )
+            else:
+                angle_loss = torch.tensor(0.0, device=device)
+                reg_loss = torch.tensor(0.0, device=device)
+            
+            # Combine losses for this layer
+            layer_loss = bbox_loss + obj_loss + cls_loss + \
+                        self.lambda_weights['angular'] * angle_loss + \
+                        self.lambda_weights['reg'] * reg_loss
+            
+            total_loss += layer_loss
+            
+            # Store individual losses
+            loss_items[f'bbox_loss_{i}'] = bbox_loss.item()
+            loss_items[f'obj_loss_{i}'] = obj_loss.item()
+            loss_items[f'cls_loss_{i}'] = cls_loss.item()
+            loss_items[f'angle_loss_{i}'] = angle_loss.item()
+            loss_items[f'reg_loss_{i}'] = reg_loss.item()
+        
+        return total_loss, loss_items
+    
+    def match_targets(self, predictions, targets):
+        """Match predictions with ground truth targets"""
+        # Implement your target matching logic here
+        # This is a placeholder
+        return {
+            'boxes': targets[:, :4],
+            'obj_mask': targets[:, 4:5],
+            'classes': targets[:, 5:6].long(),
+            'angles': targets[:, 6:7] if targets.shape[1] > 6 else None
+        }
+    
+    def bbox_loss(self, pred_boxes, target_boxes):
+        """Bounding box regression loss"""
+        # Use CIoU or your preferred box loss
+        return F.l1_loss(pred_boxes, target_boxes)
+    
 class VarifocalLoss(nn.Module):
     """
     Varifocal loss by Zhang et al.

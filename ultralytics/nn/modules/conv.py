@@ -1,5 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Convolution modules."""
+# ultralytics/nn/modules/conv.py
 
 import math
 
@@ -40,6 +41,7 @@ __all__ = (
     "Index",
     "QUpsample"
 )
+
 
 
 try:
@@ -144,6 +146,81 @@ class QConv2D(nn.Module):
         self._initialize_weights() 
 
 
+    # def _initialize_weights(self):
+    #         """
+    #         Initializes weights using a manual Lecun Normal implementation for the real part
+    #         and zeros for the imaginary parts, providing a stable starting point for training.
+    #         """
+    #         # Calculate fan-in, which is essential for the initialization math
+    #         kernel_prod = np.prod(self.kernel_size)
+    #         fan_in_component = self.in_channels_per_comp_grp * kernel_prod
+    #         if fan_in_component > 0:
+    #             # Manually implement Lecun Normal initialization for backward compatibility.
+    #             # Lecun Normal uses a standard deviation of sqrt(1 / fan_in).
+    #             std_dev = math.sqrt(5.0 / fan_in_component)
+    #             nn.init.normal(self.weight_r, mean=0.0, std=std_dev)
+    #         # Initialize imaginary components to zero for a stable start.
+    #         with torch.no_grad():
+    #             self.weight_i.zero_()
+    #             self.weight_j.zero_()
+    #             self.weight_k.zero_()
+    #         # Initialize the real bias to zero.
+    #         if self.bias_flag_overall and self.biasr is not None:
+    #             nn.init.zeros(self.bias_r)
+
+    # def _initialize_weights(self):
+    #     """
+    #     Fixed initialization that matches your CUDA kernel's Hamilton mixing.
+    #     This is THE MOST IMPORTANT fix for your 0.12 mAP issue.
+    #     """
+    #     kernel_prod = np.prod(self.kernel_size)
+    #     fan_in_component = self.in_channels_per_comp_grp * kernel_prod
+        
+    #     if fan_in_component > 0:
+    #         # He initialization for ReLU activation
+    #         std_real = math.sqrt(2.0 / fan_in_component)
+            
+    #         # Initialize real component with He init
+    #         nn.init.normal_(self.weight_r, mean=0.0, std=std_real)
+            
+    #         # CRITICAL FIX: Initialize imaginary components properly!
+    #         # Your CUDA kernel SUBTRACTS these, so use smaller magnitude
+    #         std_imag = std_real * 0.3  # 30% of real component
+            
+    #         nn.init.normal_(self.weight_i, mean=0.0, std=std_imag)
+    #         nn.init.normal_(self.weight_j, mean=0.0, std=std_imag)
+    #         nn.init.normal_(self.weight_k, mean=0.0, std=std_imag)
+            
+    #         # CRITICAL: Add noise to break symmetry
+    #         # Without this, network can't learn properly
+    #         with torch.no_grad():
+    #             noise_scale = 0.02 * std_imag
+    #             self.weight_i += torch.randn_like(self.weight_i) * noise_scale
+    #             self.weight_j += torch.randn_like(self.weight_j) * noise_scale
+    #             self.weight_k += torch.randn_like(self.weight_k) * noise_scale
+                
+    #             # # Ensure no exact zeros
+    #             # min_val = 1e-4
+    #             # self.weight_i = torch.where(
+    #             #     torch.abs(self.weight_i) < min_val,
+    #             #     torch.sign(self.weight_i) * min_val,
+    #             #     self.weight_i
+    #             # )
+    #             # self.weight_j = torch.where(
+    #             #     torch.abs(self.weight_j) < min_val,
+    #             #     torch.sign(self.weight_j) * min_val,
+    #             #     self.weight_j
+    #             # )
+    #             # self.weight_k = torch.where(
+    #             #     torch.abs(self.weight_k) < min_val,
+    #             #     torch.sign(self.weight_k) * min_val,
+    #             #     self.weight_k
+    #             # )
+        
+    #     # Initialize bias with small positive value
+    #     if self.bias_flag_overall and self.bias_r is not None:
+    #         nn.init.constant_(self.bias_r, 0.01)
+
 
     def _initialize_weights(self):
         kernel_prod = np.prod(self.kernel_size)
@@ -171,56 +248,185 @@ class QConv2D(nn.Module):
             bound_r = (1 / math.sqrt(fan_in_component)) * scales[0] if fan_in_component > 0 else 0
             nn.init.uniform_(self.bias_r, -bound_r, bound_r)
 
+    # def _initialize_weights(self):
 
+    #     if hasattr(self, 'weight_r'):
+    #         with torch.no_grad():
+    #             fan_in = self.weight_r[0].numel()
+    #             std = math.sqrt(2.0 / fan_in)
+                
+    #             # Real component - normal He init
+    #             nn.init.normal_(self.weight_r, 0, std)
+                
+    #             # Imaginary - smaller because they're SUBTRACTED
+    #             nn.init.normal_(self.weight_i, 0, std)
+    #             nn.init.normal_(self.weight_j, 0, std)
+    #             nn.init.normal_(self.weight_k, 0, std)
+                
+    #             # Critical: Add noise to break symmetry
+    #             self.weight_i += torch.randn_like(self.weight_i) * 0.01
+    #             self.weight_j += torch.randn_like(self.weight_j) * 0.01
+    #             self.weight_k += torch.randn_like(self.weight_k) * 0.01
+
+    # def _initialize_weights(self):
+    #     """
+    #     This is the REAL fix. Your initialization is broken.
+    #     Add this to your QConv2D.__init__ method.
+    #     """
+    #     # Calculate proper scale
+    #     kernel_prod = np.prod(self.kernel_size)
+    #     fan_in = self.in_channels_per_comp_grp * kernel_prod
+        
+    #     # He initialization scale
+    #     scale = np.sqrt(2.0 / fan_in)
+        
+    #     # CRITICAL: All components need proper initialization
+    #     nn.init.normal_(self.weight_r, mean=0, std=scale)
+    #     nn.init.normal_(self.weight_i, mean=0, std=scale)  # Half scale
+    #     nn.init.normal_(self.weight_j, mean=0, std=scale)
+    #     nn.init.normal_(self.weight_k, mean=0, std=scale)
+        
+    #     # Optional: Add structured initialization for better quaternion properties
+    #     with torch.no_grad():
+    #         # Ensure quaternion properties
+    #         norm = torch.sqrt(
+    #             self.weight_r**2 + self.weight_i**2 + 
+    #             self.weight_j**2 + self.weight_k**2
+    #         )
+    #         # Normalize to unit quaternions
+    #         self.weight_r /= (norm + 1e-8)
+    #         self.weight_i /= (norm + 1e-8)
+    #         self.weight_j /= (norm + 1e-8)
+    #         self.weight_k /= (norm + 1e-8)
+            
+    #         # Scale back up
+    #         self.weight_r *= scale
+    #         self.weight_i *= scale
+    #         self.weight_j *= scale
+    #         self.weight_k *= scale
+
+    # def _initialize_weights(self):
+    #     """
+    #     Initialize quaternion weights with proper scaling for COCO/large datasets.
+    #     Key insight: Don't zero out imaginary components - just reduce them!
+    #     """
+    #     kernel_prod = np.prod(self.kernel_size)
+    #     fan_in_component = self.in_channels_per_comp_grp * kernel_prod
+        
+    #     if fan_in_component > 0:
+    #         # Use Kaiming initialization but with different scaling for components
+    #         # This maintains quaternion properties while being stable
+            
+    #         # Real component - normal Kaiming
+    #         nn.init.kaiming_normal_(self.weight_r, a=0.1, mode='fan_out', nonlinearity='relu')
+            
+    #         # Imaginary components - reduced but NOT zero
+    #         # This is critical for quaternion networks to work properly!
+    #         nn.init.kaiming_normal_(self.weight_i, a=0.1, mode='fan_out', nonlinearity='relu')
+    #         nn.init.kaiming_normal_(self.weight_j, a=0.1, mode='fan_out', nonlinearity='relu')
+    #         nn.init.kaiming_normal_(self.weight_k, a=0.1, mode='fan_out', nonlinearity='relu')
+            
+    #         with torch.no_grad():
+    #             # Scale down imaginary components but keep them non-zero
+    #             self.weight_i *= 0.75  # 10% of real component
+    #             self.weight_j *= 0.75
+    #             self.weight_k *= 0.75
+                
+    #             # Add small noise to break symmetry
+    #             self.weight_i += torch.randn_like(self.weight_i) * 0.01
+    #             self.weight_j += torch.randn_like(self.weight_j) * 0.01
+    #             self.weight_k += torch.randn_like(self.weight_k) * 0.01
+        
+    #     # Initialize bias (if exists)
+    #     if self.bias_flag_overall and self.bias_r is not None:
+    #         # Small bias initialization
+    #         bound = 1 / math.sqrt(fan_in_component) if fan_in_component > 0 else 0
+    #         nn.init.uniform_(self.bias_r, -bound * 0.1, bound * 0.1)
+
+    # def _initialize_weights(self):
+    #         """
+    #         Initializes weights using a manual Lecun Normal implementation for the real part
+    #         and zeros for the imaginary parts, providing a stable starting point for training.
+    #         """
+    #         # Calculate fan-in, which is essential for the initialization math
+    #         kernel_prod = np.prod(self.kernel_size)
+    #         fan_in_component = self.in_channels_per_comp_grp * kernel_prod
+
+    #         if fan_in_component > 0:
+    #             # Manually implement Lecun Normal initialization for backward compatibility.
+    #             # Lecun Normal uses a standard deviation of sqrt(1 / fan_in).
+    #             std_dev = math.sqrt(1.0 / fan_in_component)
+    #             nn.init.normal_(self.weight_r, mean=0.0, std=std_dev)
+
+    #         # Initialize imaginary components to zero for a stable start.
+    #         with torch.no_grad():
+    #             self.weight_i.zero_()
+    #             self.weight_j.zero_()
+    #             self.weight_k.zero_()
+
+    #         # Initialize the real bias to zero.
+    #         if self.bias_flag_overall and self.bias_r is not None:
+    #             nn.init.zeros_(self.bias_r)
 
     def _rgb_to_quaternion(self, rgb_input):
         B, C, H, W = rgb_input.shape
-        device = rgb_input.device
-        dtype = rgb_input.dtype  
-        luminance = (0.299 * rgb_input[:, 0] + 0.587 * rgb_input[:, 1] + 0.114 * rgb_input[:, 2]).unsqueeze(1).to(rgb_input.device, dtype=dtype)
-        mean_brightness = rgb_input.mean(dim=1, keepdim=True).to(rgb_input.device, dtype=dtype)
-        rgb_normalized = ((rgb_input - rgb_input.min()) / (rgb_input.max() - rgb_input.min())).to(rgb_input.device, dtype=dtype)
-
+        luminance = (0.299 * rgb_input[:, 0] + 0.587 * rgb_input[:, 1] + 0.114 * rgb_input[:, 2])
+        mean_brightness = rgb_input.mean(dim=1)
+        rgb_normalized = ((rgb_input - rgb_input.min()) / (rgb_input.max() - rgb_input.min()))
+        
         def hamilton_mapping(x):
-            real = torch.zeros_like(x[:, 0:1])
-            return torch.cat([real, x[:, 0:1], x[:, 1:2], x[:, 2:3]], dim=1)
-
+            real = torch.zeros_like(x[:, 0])
+            return torch.stack([real, x[:, 0], x[:, 1], x[:, 2]], dim=-1)
+        
         def poincare_mapping(x):
-            norm = torch.norm(x, dim=1, keepdim=True)
-            x_normalized = (x / (norm + 1)).to(x.device, dtype=dtype)
-            return torch.cat([torch.sqrt(1 - torch.sum(x_normalized**2, dim=1, keepdim=True)), 
-                            x_normalized[:, 0:1], x_normalized[:, 1:2], x_normalized[:, 2:3]], dim=1)
-
+            # norm = torch.norm(x, dim=1)
+            # x_normalized = x / (norm.unsqueeze(1) + 1)
+            # real = torch.sqrt(1 - torch.sum(x_normalized**2, dim=1))
+            # return torch.stack([real, x_normalized[:, 0], x_normalized[:, 1], x_normalized[:, 2]], dim=-1)
+            norm_sq = torch.sum(x**2, dim=1, keepdim=True)
+            denominator = 1 + norm_sq
+            real = (1 - norm_sq.squeeze(1)) / denominator.squeeze(1)
+            vector_components = 2 * x / denominator
+            return torch.stack([real, vector_components[:, 0], vector_components[:, 1], vector_components[:, 2]], dim=-1)
         mappings = {
-            'luminance': torch.cat([luminance, rgb_normalized[:, 0:1], rgb_normalized[:, 1:2], rgb_normalized[:, 2:3]], dim=1),
-            'mean_brightness': torch.cat([mean_brightness, rgb_input[:, 0:1], rgb_input[:, 1:2], rgb_input[:, 2:3]], dim=1),
-            'raw_normalized': torch.cat([rgb_normalized.mean(dim=1, keepdim=True),
-                                        rgb_normalized[:, 0:1], rgb_normalized[:, 1:2], rgb_normalized[:, 2:3]], dim=1),
+            'luminance': torch.stack([luminance, rgb_normalized[:, 0], rgb_normalized[:, 1], rgb_normalized[:, 2]], dim=-1),
+            'mean_brightness': torch.stack([mean_brightness, rgb_input[:, 0], rgb_input[:, 1], rgb_input[:, 2]], dim=-1),
+            'raw_normalized': torch.stack([rgb_normalized.mean(dim=1), 
+                                        rgb_normalized[:, 0], rgb_normalized[:, 1], rgb_normalized[:, 2]], dim=-1),
             'hamilton': hamilton_mapping(rgb_input),
             'poincare': poincare_mapping(rgb_input)
         }
-        # Map RGB to B, 1, 4, H, W for the first layer input
-        # The CUDA kernel expects input [B, C_in_per_q, Q=4, H, W]
-        mapped = mappings[self.mapping_type] # Shape [B, 4, H, W]
-        # Add C_in_per_q=1 dimension
-        mapped_final = mapped.unsqueeze(1) # Shape [B, 1, 4, H, W]
-        return mapped_final.to(dtype=dtype)
-
+        
+        # Output shape: [B, 1, H, W, 4]
+        return mappings[self.mapping_type].unsqueeze(1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of quaternion convolution
+        
+        Args:
+            x: Input tensor
+            - [B, C, H, W] for RGB input (first layer)
+            - [B, C*4, H, W] for standard input (will be reshaped to BCHWQ)
+            - [B, C, H, W, 4] for quaternion input (BCHWQ format)
+        Returns:
+            torch.Tensor: Output in BCHWQ format [B, C_out, H_out, W_out, 4]
+        """    
         original_shape = None
         if self.is_first_layer:
-            x = self._rgb_to_quaternion(x) # Output shape [B, 1, 4, H, W]
+            B, C_rgb, H, W = x.shape
+            assert C_rgb == 3, f"Expected 3 RGB channels, got {C_rgb}"
+            x = self._rgb_to_quaternion(x) # Output shape [B, 1, H, W, 4]
         elif x.dim() == 4: # Standard tensor B, C, H, W -> B, C/4, 4, H, W
             B, C, H, W = x.shape
             original_shape = x.shape
-            if C != self.in_channels_total:
-                print(f"Warning: Input channel mismatch! Expected {self.in_channels_total}, got {C}")
-            assert C % 4 == 0, f"Input channels {C} must be multiple of 4 for non-first layer standard input"
-            x = x.view(B, C // 4, 4, H, W)
+            assert C == self.in_channels_total, f"Expected {self.in_channels_total} channels, got {C}"
+            assert C % 4 == 0, f"Input channels {C} must be multiple of 4"
+            # Reshape to BCHWQ: [B, C//4, H, W, 4]
+            x = x.view(B, C // 4, 4, H, W).permute(0, 1, 3, 4, 2)
         elif x.dim() == 5: # Already in quaternion format
             assert x.size(1) == self.in_channels_per_comp, f"Input C_per_q mismatch {x.size(1)} vs {self.in_channels_per_comp}"
-            assert x.size(2) == 4, "Input quaternion dim must be 4"
+            assert x.size(4) == 4, "Input quaternion dim must be 4"
         else:
             raise ValueError(f"Unsupported input shape: {x.shape}")
 
@@ -237,21 +443,6 @@ class QConv2D(nn.Module):
         bias_j = None
         bias_k = None
 
-
-
-        # if CUDA_EXT and x.is_cuda:
-        #      # Call the updated function with 4 weights and 4 biases
-        #      output = quaternion_ops.qconv_forward(
-        #          x,
-        #          weight_r, weight_i, weight_j, weight_k,
-        #          bias_r, bias_i, bias_j, bias_k,
-        #          list(self.stride),
-        #          list(self.padding),
-        #          list(self.dilation),
-        #          self.groups
-        #      )
-        #      return output
-        # else:
         if CUDA_EXT and x.is_cuda:
             # Use the autograd function wrapper with CUDA backward
             output = qconv2d_function(
@@ -267,15 +458,17 @@ class QConv2D(nn.Module):
             )
             return output
         else:
-            # Pytorch fallback
-            xr, xi, xj, xk = torch.split(x, 1, dim=2) 
-            xr = xr.squeeze(2) 
-            xi = xi.squeeze(2)
-            xj = xj.squeeze(2)
-            xk = xk.squeeze(2)
+            # PyTorch fallback for BCHWQ layout
+            # Input x shape: [B, C, H, W, 4]
+            xr, xi, xj, xk = torch.split(x, 1, dim=4)
+            xr = xr.squeeze(4)
+            xi = xi.squeeze(4)
+            xj = xj.squeeze(4)
+            xk = xk.squeeze(4)
 
             conv_params = dict(stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups)
 
+            # Separable conv
             r_conv = F.conv2d(xr, self.weight_r, self.bias_r, **conv_params)
             i_conv = F.conv2d(xi, self.weight_i, self.bias_i, **conv_params)
             j_conv = F.conv2d(xj, self.weight_j, self.bias_j, **conv_params)
@@ -286,9 +479,8 @@ class QConv2D(nn.Module):
             out_j = -r_conv - i_conv + j_conv + k_conv
             out_k = -r_conv + i_conv - j_conv + k_conv
 
-            # Stack back into [B, C_out_per_q, Q=4, H_out, W_out]
-            return torch.stack([out_r, out_i, out_j, out_k], dim=2)
-
+            # Stack back into [B, C_out, H_out, W_out, 4]
+            return torch.stack([out_r, out_i, out_j, out_k], dim=4)
 
 class IQBN(nn.Module):
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
@@ -310,11 +502,16 @@ class IQBN(nn.Module):
         self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: [B, C, Q, H, W]
-        B, C, Q, H, W = x.shape
-        assert C == self.num_features, f"Input channels {C} != registered features {self.num_features}"
-        assert Q == 4, "Input quaternion dimension must be 4"
-
+        """
+        Forward pass for BCHWQ layout.
+        
+        Args:
+            x: Input tensor of shape [B, C, H, W, 4]
+        Returns:
+            Normalized tensor of shape [B, C, H, W, 4]
+        """
+        assert x.dim() == 5 and x.size(4) == 4, "Input must be [B, C, H, W, 4]"
+        B, C, H, W, Q = x.shape
 
         input_dtype = x.dtype
         gamma = self.gamma.to(dtype=input_dtype)
@@ -322,31 +519,26 @@ class IQBN(nn.Module):
         running_mean = self.running_mean.to(dtype=input_dtype)
         running_var = self.running_var.to(dtype=input_dtype)
         if not self.training or not CUDA_EXT:
-            # Use CUDA extension for inference OR if fallback 
             if CUDA_EXT and not self.training and x.is_cuda:
                  x = x.contiguous()
-                 gamma = self.gamma.contiguous()
-                 beta = self.beta.contiguous()
-                 running_mean = self.running_mean.contiguous()
-                 running_var = self.running_var.contiguous()
+                 gamma = gamma.contiguous()
+                 beta = beta.contiguous()
+                 running_mean = running_mean.contiguous()
+                 running_var = running_var.contiguous()
                  return quaternion_ops.iqbn_forward(x, gamma, beta, running_mean, running_var, self.eps)
             else:
                 # Pytorch fallback
-                mean = self.running_mean.view(1, self.num_features, 4, 1, 1)
-                var = self.running_var.view(1, self.num_features, 4, 1, 1)
-                gamma_view = self.gamma.view(1, self.num_features, 4, 1, 1)
-                beta_view = self.beta.view(1, self.num_features, 4, 1, 1)
+                mean = running_mean.view(1, C, 1, 1, 4)
+                var = running_var.view(1, C, 1, 1, 4)
+                gamma_view = gamma.view(1, C, 1, 1, 4)
+                beta_view = beta.view(1, C, 1, 1, 4)
                 x_norm = (x - mean) / torch.sqrt(var + self.eps)
                 return x_norm * gamma_view + beta_view
         else:
-            # Training path
-
-            x_flat = x.permute(0, 2, 1, 3, 4).contiguous().view(B * Q, C, H * W) 
-            mean = x_flat.mean(dim=[0, 2]) 
-
-            # Calculate batch stats per (C, Q)
-            mean_batch = x.mean(dim=[0, 3, 4]) # [C, Q]
-            var_batch = x.var(dim=[0, 3, 4], unbiased=False) + 1e-8 # [C, Q]
+            # Training mode - calculate batch statistics
+            # For BCHWQ: average over B, H, W dimensions, keep C and Q separate
+            mean_batch = x.mean(dim=[0, 2, 3])  # [C, 4]
+            var_batch = x.var(dim=[0, 2, 3], unbiased=False) + 1e-8  # [C, 4]
 
             # Update running stats
             with torch.no_grad():
@@ -355,28 +547,52 @@ class IQBN(nn.Module):
                 self.num_batches_tracked += 1
 
             # Normalize w/batch statistics
-            x_norm = (x - mean_batch.view(1, C, Q, 1, 1)) / torch.sqrt(var_batch.view(1, C, Q, 1, 1) + self.eps)
+            x_norm = (x - mean_batch.view(1, C, 1, 1, 4)) / torch.sqrt(var_batch.view(1, C, 1, 1, 4) + self.eps)
 
             # Apply affine parameters
-            gamma_view = self.gamma.view(1, C, Q, 1, 1)
-            beta_view = self.beta.view(1, C, Q, 1, 1)
+            gamma_view = gamma.view(1, C, 1, 1, 4)
+            beta_view = beta.view(1, C, 1, 1, 4)
             return x_norm * gamma_view + beta_view
 
+# class IQLN(nn.Module):
+#     def __init__(self, num_features, eps=1e-5, elementwise_affine=True):
+#         super().__init__()
+#         self.ln = nn.LayerNorm(num_features, eps=eps, elementwise_affine=elementwise_affine)
+        
+#     def forward(self, x):
+#         # x shape: [B, C, H, W, 4]
+#         B, C, H, W, Q = x.shape
+        
+#         x_reshaped = x.permute(0, 2, 3, 1, 4).reshape(B, H, W, C * Q)
+#         x_ln = self.ln(x_reshaped)
+        
+#         # Reshape back to [B, C, H, W, 4]
+#         return x_ln.view(B, H, W, C, Q).permute(0, 3, 1, 2, 4)
+    
 class IQLN(nn.Module):
-    def __init__(self, num_features, eps=1e-5, elementwise_affine=True):
+    """Layer normalization for quaternion features"""
+    def __init__(self, normalized_shape, eps=1e-5):
         super().__init__()
-        self.ln = nn.LayerNorm(num_features, eps=eps, elementwise_affine=elementwise_affine)
+        self.normalized_shape = normalized_shape
+        self.eps = eps
+        
+        # Separate parameters for each quaternion component
+        self.weight = nn.Parameter(torch.ones(normalized_shape, 4))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape, 4))
         
     def forward(self, x):
-        # x shape: [B, C, 4, H, W]
-        B, C, Q, H, W = x.shape
+        # x shape: [B, C, H, W, 4]
+        # Normalize over C, H, W dimensions (keep B and quaternion separate)
+        mean = x.mean(dim=[1, 2, 3], keepdim=True)
+        var = x.var(dim=[1, 2, 3], keepdim=True, unbiased=False)
         
-        x_reshaped = x.permute(0, 3, 4, 1, 2).reshape(B, H*W, C*Q)
-        x_ln = self.ln(x_reshaped)
+        x_norm = (x - mean) / torch.sqrt(var + self.eps)
         
-        # Reshape back to [B, C, 4, H, W]
-        return x_ln.reshape(B, H, W, C, Q).permute(0, 3, 4, 1, 2)
-
+        # Apply affine transform
+        weight = self.weight.view(1, -1, 1, 1, 4)
+        bias = self.bias.view(1, -1, 1, 1, 4)
+        
+        return x_norm * weight + bias
 # Deprecated class
 class QConv(nn.Module):
     """
@@ -552,9 +768,7 @@ class QConv(nn.Module):
         return mappings[self.mapping_type]
 
 
-
-
-# Conv using quaternion conv
+# # Conv using quaternion conv
 class Conv(nn.Module):
     default_act = nn.SiLU()  # default activation
 
@@ -575,18 +789,15 @@ class Conv(nn.Module):
     def forward(self, x):
         """Apply convolution, batch normalization and activation to input tensor."""
         # print(f"X type: {x.dtype}")
-        out = self.conv(x)
-        out = self.bn(out)
-        out = self.act(out)
-        return out
+
+        return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
         """Apply convolution and activation without batch normalization."""
-        out = self.conv(x)
-        out = self.act(out)
-        return out
+        return self.act(self.conv(x))
 
-# Conv using real-valued
+
+# # Conv using real-valued
 # class Conv(nn.Module):
 #     """
 #     Standard convolution module with batch normalization and activation.
@@ -642,7 +853,6 @@ class Conv(nn.Module):
 #             (torch.Tensor): Output tensor.
 #         """
 #         return self.act(self.conv(x))
-
 
 
 class Conv2(Conv):
@@ -973,6 +1183,22 @@ class QConcat(nn.Module):
             
         return concat
 
+# class QUpsample(nn.Module):
+#     def __init__(self, scale_factor=2, mode='nearest'):
+#         super().__init__()
+#         self.scale_factor = scale_factor
+#         self.mode = mode
+
+#     def forward(self, x):
+#         B, C, Q, H, W = x.shape
+#         # Flatten Q into channel dim
+#         x = x.view(B, C * Q, H, W)
+#         # Apply upsampling once across all channels
+#         x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+#         # Reshape back to quaternion format
+#         x = x.view(B, C, Q, x.shape[-2], x.shape[-1])
+#         return x
+
 class QUpsample(nn.Module):
     def __init__(self, scale_factor=2, mode='nearest'):
         super().__init__()
@@ -980,12 +1206,18 @@ class QUpsample(nn.Module):
         self.mode = mode
 
     def forward(self, x):
-        B, C, Q, H, W = x.shape
-        # Flatten Q into channel dim
-        x = x.view(B, C * Q, H, W)
-        # Apply upsampling once across all channels
-        x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
-        # Reshape back to quaternion format
-        x = x.view(B, C, Q, x.shape[-2], x.shape[-1])
-        return x
-
+        B, C, H, W, Q = x.shape
+        assert Q == 4, "Expected quaternion format"
+        
+        # Apply upsampling to each quaternion component
+        upsampled_components = []
+        for q_idx in range(4):
+            component = x[..., q_idx]  # [B, C, H, W]
+            upsampled = F.interpolate(
+                component, 
+                scale_factor=self.scale_factor, 
+                mode=self.mode
+            )
+            upsampled_components.append(upsampled)
+        
+        return torch.stack(upsampled_components, dim=-1)

@@ -1,9 +1,10 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Model head modules."""
-
+# ultralytics/nn/modules/head.py
 import copy
 import math
-
+from torch.autograd import Function
+# import quaternion_ops
 import torch
 import torch.nn as nn
 from torch.nn.init import constant_, xavier_uniform_
@@ -15,97 +16,60 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 import torch.nn.functional as F
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "HybridDetect"
 
 '''
 OG Class
 
 '''
-# class QExtractReal(nn.Module):
-#     """
-#     Efficiently projects quaternion features to standard format without 4x channel expansion
-#     """
-#     def __init__(self, in_channels, out_channels=None):
-#         super().__init__()
-#         # Learnable weights for quaternion components with slight initial bias toward real part
-#         self.weights = nn.Parameter(torch.tensor([1.5, 0.7, 0.7, 0.7]))
-#         # Optional projection to different channel dimension
-#         self.output_proj = nn.Conv2d(in_channels, out_channels, 1)
-#         self.bias = self.output_proj.bias
-
-#     def forward(self, x):
-#         # x shape: [B, C, 4, H, W]
-#         B, C, Q, H, W = x.shape
-#         assert Q == 4, "Expected quaternion input with 4 components"
-        
-#         # Create normalized weights for quaternion components
-#         weights = F.softmax(self.weights, dim=0).view(1, 1, 4, 1, 1)
-        
-#         # Weighted projection along quaternion dimension - much more efficient than concatenation
-#         projected = (x * weights).sum(dim=2)  # Shape: [B, C, H, W]
-        
-#         # Optional channel projection
-
-#         return self.output_proj(projected)
-
-'''
-Learnable Class
-'''
 
 class QER(nn.Module):
-    def __init__(self, in_channels, out_channels=None):
+    def __init__(self, in_channels, out_channels=None, kernel_size=None):
         super().__init__()
         self.act = nn.SiLU()
         self.bn = nn.BatchNorm2d(out_channels)
-        self.output_proj = nn.Conv2d(in_channels * 4, out_channels, kernel_size=1)
+        self.output_proj = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size)
         self.bias = self.output_proj.bias
     def forward(self, x):
-        B, C, Q, H, W = x.shape
-        x = x.permute(0, 2, 1, 3, 4).reshape(B, C*4, H, W)
+        B, C, H, W, Q = x.shape
+        x = x.permute(0, 1, 4, 2, 3).reshape(B, C*4, H, W)
         return self.output_proj(x)
 
-# class QER(nn.Module):
-#     def __init__(self, in_channels, out_channels=None):
-#         super().__init__()
-#         # Initialize with bias toward real component
-#         self.weights = nn.Parameter(torch.tensor([1.2, 0.8, 0.8, 0.8]))
-#         # The 1x1 conv will handle channel transformations
-#         self.output_proj = nn.Conv2d(in_channels, out_channels, 1)
-#         # Register a buffer for target weights - not used in computation but accessible
-#         self.register_buffer('target_weights', torch.tensor([1.2, 0.8, 0.8, 0.8]))
-#         self.bias = self.output_proj.bias
-#         self.act = nn.SiLU()
-#         self.bn = nn.BatchNorm2d(out_channels)
-#     def forward(self, x):
-#         B, C, Q, H, W = x.shape
-#         # Normalize weights for weighted sum
-#         weights = F.softmax(self.weights, dim=0).view(1, 1, 4, 1, 1)
-#         # Weighted sum across quaternion components
-#         projected = (x * weights).sum(dim=2)  # Shape: [B, C, H, W]
-#         return self.output_proj(projected)
-        
-        
-#     def get_reg_loss(self):
-#         """Return regularization loss term to add to main loss"""
-#         return 0.01 * F.mse_loss(self.weights, self.target_weights)
 
-'''
-Real Projection Class
-'''
-# class QExtractReal(nn.Module):
-#     """Extract real component and expand channels to maintain information capacity"""
-#     def __init__(self, in_channels, out_channels=None):
-#         super().__init__()
-#         # For direct extraction, we need 4x input channels to maintain capacity
-#         expanded_channels = in_channels * 4
-#         self.output_proj = nn.Conv2d(in_channels, out_channels, 1)
-#         self.bias = self.output_proj.bias
-#     def forward(self, x):
-#         # Extract only the real component (first quaternion component)
-#         real_component = x[:, :, 0, :, :]
+class QERPreserve(nn.Module):
+    """
+    Better quaternion extraction that preserves more information.
+    Instead of just taking real part, use all components.
+    """
+    def __init__(self, c1, c2, k=1):
+        super().__init__()
+        # c1 is quaternion channels (must be divisible by 4)
+        # c2 is output channels
+        assert c1 % 4 == 0
+        self.c1 = c1
+        self.c2 = c2
         
-#         # Project to output channels (which should be 4x input channels)
-#         return self.output_proj(real_component)
+        # Learnable mixing matrix for quaternion components
+        # This is more flexible than just extracting real
+        self.mix = nn.Conv2d(c1, c2, k, bias=True)
+        self.bias = self.mix.bias
+        # Initialize to preserve information
+        with torch.no_grad():
+            # Start with identity-like mapping
+            nn.init.xavier_normal_(self.mix.weight)
+            nn.init.zeros_(self.mix.bias)
+    
+    def forward(self, x):
+        # x: [B, C, H, W, 4] quaternion
+        B, C, H, W, Q = x.shape
+        
+        # Flatten quaternion to channels
+        x = x.permute(0, 1, 4, 2, 3).reshape(B, C*4, H, W)
+        
+        # Apply learnable mixing
+        return self.mix(x)
+
+
 
 
 class Detect(nn.Module):
@@ -115,7 +79,7 @@ class Detect(nn.Module):
     export = False  # export mode
     format = None  # export format
     end2end = False  # end2end
-    max_det = 300  # max_det
+    max_det = 300 # max_det
     shape = None
     anchors = torch.empty(0)  # init
     strides = torch.empty(0)  # init
@@ -129,28 +93,34 @@ class Detect(nn.Module):
         self.reg_max = 16  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
-        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
+        c2, c3 = max((ch[0] // 2, self.reg_max * 4)), max(ch[0], min(self.nc, 256))  # channels
+
         self.cv2 = nn.ModuleList(
             nn.Sequential(
                 Conv(x, c2, 3),  # Using c2 for intermediate channels
                 Conv(c2, c2, 3), 
-                QER(c2//4, 4*self.reg_max),  # Extract real component and scale back
+                QER(c2, 4*self.reg_max, 1),  # Extract real component and scale back
                 # nn.Conv2d(c2, 4 * self.reg_max, 1)
             ) for x in ch
         )
+
         self.cv3 = nn.ModuleList(
             nn.Sequential(
-                nn.Sequential(Conv(x, x, 3), Conv(x, c3, 1)),  # Using c3 for intermediate channels
-                nn.Sequential(Conv(c3, c3, 3), Conv(c3, c3, 1)),
-                QER(c3//4, self.nc),  # Extract real component and scale back
+                nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),  # Using c3 for intermediate channels
+                nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                QER(c3, nc, 1),  # Better than QER
                 # nn.Conv2d(c3, self.nc, 1)
+
             ) for x in ch
         )
+
+
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
         if self.end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
+
 
     def forward(self, x):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
@@ -302,7 +272,43 @@ class Segment(Detect):
             return x, mc, p
         return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
 
-
+class HybridDetect(Detect):
+    """
+    Hybrid detection head that uses quaternion backbone features 
+    but regular convolutions for final predictions to avoid 
+    information loss on large datasets like COCO.
+    """
+    
+    def __init__(self, nc=80, ch=()):
+        """Initialize with same structure as Detect but modified final layers"""
+        super().__init__(nc, ch)
+        
+        # Get dimensions from parent initialization
+        c2 = max((ch[0] // 4, self.reg_max * 4))
+        c3 = max(ch[0], min(self.nc, 100))
+        
+        # Override cv2 and cv3 to handle quaternion->real conversion better
+        for i in range(self.nl):
+            # Box regression path
+            x = ch[i]
+            self.cv2[i] = nn.Sequential(
+                Conv(x, c2, 3),  # Quaternion conv
+                Conv(c2, c2, 3),  # Quaternion conv  
+                QER(c2//4, c2, 1),  # Extract real: [B,C,H,W,4] -> [B,C*4,H,W]
+                nn.Conv2d(c2, 4 * self.reg_max, 1)  # Regular conv on expanded features
+            )
+            
+            # Classification path with skip connection
+            self.cv3[i] = nn.Sequential(
+                Conv(x, c3, 3),  # Quaternion conv
+                QER(c3//4, c3, 1),  # Extract real
+                nn.Conv2d(c3, self.nc, 1)  # Regular conv
+            )
+            
+    def forward(self, x):
+        """Same forward as Detect parent class"""
+        return super().forward(x)
+    
 class OBB(Detect):
     """YOLO OBB detection head for detection with rotation models."""
 
@@ -314,9 +320,10 @@ class OBB(Detect):
         c4 = max(ch[0] // 4, self.ne)
         self.cv4 = nn.ModuleList(
             nn.Sequential(
+
                 Conv(x, c4, 3),
                 Conv(c4, c4, 3),
-                QExtractReal(),
+                QER(c4//4, c4, 1),  # Extract real component and scale back
                 nn.Conv2d(c4, self.ne, 1)
                 ) for x in ch)
 

@@ -1,5 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Block modules."""
+# ultralytics/nn/modules/block.py
 
 import torch
 import torch.nn as nn
@@ -82,24 +83,75 @@ class DFL(nn.Module):
         # return self.conv(x.view(b, self.c1, 4, a).softmax(1)).view(b, 4, a)
 
 class QuaternionMaxPool(nn.Module):
-    """Quaternion-aware max pooling"""
+    """Quaternion-aware max pooling for BCHWQ layout"""
     def __init__(self, kernel_size=2, stride=2, padding=0):
         super().__init__()
         self.pool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, Q, H, W = x.shape
+        """
+        Input: [B, C, H, W, 4] - BCHWQ format
+        Output: [B, C, H_out, W_out, 4]
+        """
+        B, C, H, W, Q = x.shape
         assert Q == 4, "Expected quaternion format with 4 components"
+        
+        # Apply pooling to each quaternion component separately
+        pooled_components = []
+        for q_idx in range(4):
+            # Extract component: [B, C, H, W]
+            component = x[..., q_idx]
+            # Apply pooling: [B, C, H_out, W_out]
+            pooled = self.pool(component)
+            pooled_components.append(pooled)
+        
+        # Stack components back: [B, C, H_out, W_out, 4]
+        return torch.stack(pooled_components, dim=-1)
+    
+class QuaternionAdaptiveAvgPool2d(nn.Module):
+    """Quaternion-aware adaptive average pooling for BCHWQ layout"""
+    def __init__(self, output_size):
+        super().__init__()
+        self.output_size = output_size
+        self.pool = nn.AdaptiveAvgPool2d(output_size)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Input: [B, C, H, W, 4] - BCHWQ format  
+        Output: [B, C, H_out, W_out, 4]
+        """
+        B, C, H, W, Q = x.shape
+        assert Q == 4, "Expected quaternion format"
+        
+        # Apply pooling to each quaternion component
+        pooled_components = []
+        for q_idx in range(4):
+            component = x[..., q_idx]  # [B, C, H, W]
+            pooled = self.pool(component)  # [B, C, H_out, W_out]
+            pooled_components.append(pooled)
+        
+        return torch.stack(pooled_components, dim=-1)
 
-        # Reshape to (B * Q, C, H, W) for spatial pooling
-        x_flat = x.reshape(B*Q, C, H, W)
+class QuaternionDropout(nn.Module):
+    """Quaternion-aware dropout that maintains quaternion structure"""
+    def __init__(self, p=0.1):
+        super().__init__()
+        self.p = p
+        
+    def forward(self, x):
+        """
+        Input: [B, C, H, W, 4] - BCHWQ format
+        Output: [B, C, H, W, 4] 
+        """
+        if not self.training:
+            return x
+            
+        B, C, H, W, Q = x.shape
+        # Apply same dropout mask to entire quaternion (all 4 components)
+        # Mask shape: [B, C, H, W, 1] -> broadcast to [B, C, H, W, 4]
+        mask = torch.bernoulli(torch.full((B, C, H, W, 1), 1-self.p, device=x.device))
+        return x * mask  # Broadcasting handles the quaternion dimension
 
-        # Apply pooling
-        pooled = self.pool(x_flat)
-
-        # Reshape back to (B, C, 4, H_out, W_out)
-        H_out, W_out = pooled.shape[-2:]
-        return pooled.reshape(B, C, Q, H_out, W_out)
 
 class Proto(nn.Module):
     """YOLOv8 mask Proto module for segmentation models."""
@@ -216,40 +268,38 @@ class SPPF(nn.Module):
 
 
 class QSPPF(nn.Module):
-    """
-    Spatial Pyramid Pooling - Fast (SPPF) layer for quaternion neural networks.
-    Maintains quaternion structure throughout the pooling pyramid.
-    """
-    def __init__(self, c1, c2, k=5):
+    """SPPF with quaternion support and dropout for BCHWQ layout"""
+    def __init__(self, c1, c2, k=5, dropout_p=0.1):
         super().__init__()
-        
-        # Set up intermediate channels (half of in_channels), ensuring multiple of 4
         c_ = c1 // 2
-        assert c_ % 4 == 0, "Hidden channels must be a multiple of 4"
-
-        # First convolution to reduce channel dimensionality
-        self.cv1 = Conv(c1, c_, 1, 1)
-        
-        # Max pooling with kernel size and stride of 1
-        self.pool = QuaternionMaxPool(kernel_size=k, stride=1, padding = k//2)
-        
-        # Final convolution after concatenation to project back to out_channels
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        assert c_ % 4 == 0, "Hidden channels must be multiple of 4"
+        self.cv1 = Conv(c1, c_, 1, 1)  # This will use standard conv since it's entry point
+        self.pool = QuaternionMaxPool(kernel_size=k, stride=1, padding=k//2)
+        self.m = nn.ModuleList([
+            QuaternionMaxPool(kernel_size=k, stride=1, padding=k//2),
+            QuaternionMaxPool(kernel_size=k*2, stride=1, padding=k),
+            QuaternionMaxPool(kernel_size=k*3, stride=1, padding=k*3//2),
+        ])
+        self.cv2 = Conv(c_ * 4, c2, 1, 1)  # Exit point
+        self.dropout = QuaternionDropout(dropout_p)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through the SPPF layer.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, in_channels, 4, H, W)
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, out_channels, 4, H, W)
+        Forward pass expecting quaternion input in BCHWQ format
         """
-        # Initial convolution
-        y = [self.cv1(x)]
+        if x.dim() == 4:  # Standard [B, C, H, W]
+            B, C, H, W = x.shape
+            assert C % 4 == 0, "Channels must be multiple of 4 for quaternion conversion"
+            x = x.view(B, C//4, H, W, 4)
+        y = [self.cv1(x)] 
+        
+        # Apply pooling 
         y.extend(self.pool(y[-1]) for _ in range(3))
-        return self.cv2(torch.cat(y, 1))
+        # print(f"QSPPF1 size: {y.size}")
+
+        # Concatenate along channel dimension and apply dropout
+        out = self.cv2(torch.cat(y, 1))
+        return out
 
 class C1(nn.Module):
     """CSP Bottleneck with 1 convolution."""
@@ -834,6 +884,7 @@ class C3k2(C2f):
         )
 
 
+
 class C3k(C3):
     """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
 
@@ -1336,7 +1387,6 @@ class QPSABlock(nn.Module):
         super().__init__()
         assert c % 4 == 0, "Channels must be multiple of 4"
         self.Q = 4  # Quaternion dimension
-
         # Attention: [B, C, 4, H, W] -> [B, C, 4, H, W]
         # Splits into Q,K,V while maintaining quaternion structure
         self.attn = QAttention(dim=c, num_heads=num_heads, attn_ratio=attn_ratio)
@@ -1439,70 +1489,68 @@ class QAttention(nn.Module):
     def __init__(self, dim, num_heads=8, attn_ratio=0.5):
         super().__init__()
         # Account for quaternion channels
-        dim = dim // 4
+        dim = dim
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = (dim // 4) // num_heads
         self.key_dim = int(self.head_dim * attn_ratio)
         self.scale = self.key_dim**-0.5
         
         # Calculate dimensions for QKV projection
         nh_kd = self.key_dim * num_heads
-        h = dim + nh_kd * 2  # This will be multiplied by 4 in the Conv layer
-        self.qkv = Conv(dim * 4, h * 4, 1, act=False)  # Adjust for quaternion channels
-        self.proj = Conv(dim * 4, dim * 4, 1, act=False)
-        self.pe = Conv(dim * 4, dim * 4, 3, 1, g=dim, act=False)
-        self.norm = IQLN(dim*4)
+        h = (dim // 4) + nh_kd * 2  # Total output channels for QKV
+        
+        # QKV projection using quaternion convolution
+        self.qkv = QConv2D(dim, h* 4, kernel_size=1, bias=False)
+        self.proj = QConv2D(dim, dim, kernel_size=1, bias=False)
+        self.pe = QConv2D(dim, dim, kernel_size=3, padding=1, groups=dim // 4, bias=False)
+        self.norm = IQLN(dim // 4)  # IQLN expects number of quaternion channels
+
     def forward(self, x):
         """
         Args:
-            x: Input tensor [B, C, 4, H, W]
+            x: Input tensor [B, C, H, W, 4]
         """
-        self.norm(x)
-        B, C, Q, H, W = x.shape
-
+        # x = self.norm(x)
+        B, C, H, W, Q = x.shape
         N = H * W
-        C = C // 4  # Actual channels excluding quaternion dimension
         
         # QKV projection
-        qkv = self.qkv(x)  # [B, (2Kh + Vh)*4, 4, H, W]
+        qkv = self.qkv(x)  # [B, (C + 2*Kh), H, W, 4]
         
-        # First reshape to separate heads while keeping quaternion structure
-        qkv = qkv.view(B, -1, Q, N)  # [B, (2Kh + Vh), 4, HW]
-        q, k, v = qkv.split([self.key_dim * self.num_heads, 
-                            self.key_dim * self.num_heads, 
-                            self.head_dim * self.num_heads], dim=1)
+        # Calculate output channels
+        q_channels = self.key_dim * self.num_heads
+        k_channels = self.key_dim * self.num_heads
+        v_channels = self.head_dim * self.num_heads
         
-        # Reshape to separate heads
-        q = q.view(B, self.num_heads, self.key_dim, Q, N)  # [B, h, K, 4, N]
-        k = k.view(B, self.num_heads, self.key_dim, Q, N)  # [B, h, K, 4, N]
-        v = v.view(B, self.num_heads, self.head_dim, Q, N)  # [B, h, V, 4, N]
+        # Split QKV
+        q, k, v = torch.split(qkv, [q_channels, k_channels, v_channels], dim=1)
         
-        # Transpose for attention computation
-        q = q.permute(0, 1, 3, 4, 2)  # [B, h, 4, N, K]
-        k = k.permute(0, 1, 3, 2, 4)  # [B, h, 4, K, N]
-        v = v.permute(0, 1, 3, 4, 2)  # [B, h, 4, N, V]
+        # Reshape for attention - keep quaternion dimension
+        # [B, channels, H, W, 4] -> [B, num_heads, head_dim, N, 4]
+        q = q.reshape(B, self.num_heads, self.key_dim, N, Q).permute(0, 1, 4, 3, 2)  # [B, h, 4, N, K]
+        k = k.reshape(B, self.num_heads, self.key_dim, N, Q).permute(0, 1, 4, 2, 3)  # [B, h, 4, K, N]
+        v = v.reshape(B, self.num_heads, self.head_dim, N, Q).permute(0, 1, 4, 3, 2)  # [B, h, 4, N, V]
         
-        # Attention computation
+        # Attention computation - separate for each quaternion component
         attn = torch.matmul(q, k) * self.scale  # [B, h, 4, N, N]
         attn = attn.softmax(dim=-1)
         
-        # Apply attention and reshape
+        # Apply attention
         x = torch.matmul(attn, v)  # [B, h, 4, N, V]
-        x = x.permute(0, 1, 4, 2, 3).reshape(B, C * 4, Q, H, W)
+        x = x.permute(0, 1, 4, 3, 2).reshape(B, C, H, W, Q)  # Back to [B, C, H, W, 4]
         
         # Apply PE and projection
         x = x + self.pe(x)
         x = self.proj(x)
-        
-        return x
-
+        # x = self.norm(x)
+        return x 
+    
 class QC2PSA(nn.Module):
     """C2PSA module with proper quaternion handling."""
     def __init__(self, c1, c2, n=1, e=0.5):
         super(QC2PSA, self).__init__()
         
-
-        
+        # hidden_mult = 2.0 if c1 >= 512 else 1.5
         self.c = int(c1 * e)
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c2, 1)
@@ -1516,24 +1564,24 @@ class QC2PSA(nn.Module):
                 num_heads=max(1, self.c // 16)  # Adjust head count appropriately
             ) for _ in range(n)
         ])
-        
+            
     def forward(self, x):
         """
         Args:
-            x: Input tensor [B, C//4, 4, H, W] 
-               e.g., for c1=1024: [B, 256, 4, H, W]
+            x: Input tensor [B, C, H, W, 4] 
+            e.g., for c1=1024: [B, 256, H, W, 4]
         """
         # Split while preserving quaternion structure
-        features = self.cv1(x)  # [B, 2*c, 4, H, W]
-        a, b = features.chunk(2, dim=1)  # Each [B, c, 4, H, W]
+        features = self.cv1(x)  # [B, 2*c, H, W, 4]
+        a, b = features.chunk(2, dim=1)  # Each [B, c, H, W, 4]
         
         # Process through attention blocks
         b = self.m(b)
         
         # Combine and project
-        out = self.cv2(torch.cat([a, b], dim=1))  # Back to [B, C//4, 4, H, W]
-        return out
-    
+        out = self.cv2(torch.cat([a, b], dim=1))  # Back to [B, C, H, W, 4]
+        return out  
+
 USE_FLASH_ATTN = False
 import torch
 # if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:  # Ampere or newer
@@ -1738,3 +1786,4 @@ class A2C2f(nn.Module):
         if self.gamma is not None:
             return x + self.gamma.view(1, -1, 1, 1) * self.cv2(torch.cat(y, 1))
         return self.cv2(torch.cat(y, 1))
+    

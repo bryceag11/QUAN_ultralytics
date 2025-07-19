@@ -1,7 +1,8 @@
-// quaternion_ops.cu - Implement baked-in Hamilton product
+// quaternion_ops.cu
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 template <typename scalar_t>
 __global__ void iqbn_forward_kernel(
@@ -11,20 +12,22 @@ __global__ void iqbn_forward_kernel(
     const scalar_t* __restrict__ beta,
     const scalar_t* __restrict__ running_mean,
     const scalar_t* __restrict__ running_var,
-    const int N,        
-    const int C_per_q,  
-    const int Q,          
+    const int B,        
+    const int C,  
     const int HW,         
     const float eps) {
 
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= N * C_per_q * Q * HW) return;
+    const int total_elements = B * C * HW * 4;
+    if (index >= total_elements) return;
 
-    // Calculate indices
-    const int q = (index / HW) % Q;
-    const int c = (index / (HW * Q)) % C_per_q;
+    // BCHWQ indexing
+    const int q = index % 4;
+    const int hw_idx = (index / 4) % HW;
+    const int c = (index / (4 * HW)) % C;
+    const int b = index / (4 * HW * C);
 
-    const int stat_idx = c * Q + q; 
+    const int stat_idx = c * 4 + q; 
 
     const scalar_t mean = running_mean[stat_idx];
     const scalar_t var = running_var[stat_idx];
@@ -49,8 +52,8 @@ __global__ void qconv_forward_kernel_hamilton(
     const scalar_t* __restrict__ bias_j,
     const scalar_t* __restrict__ bias_k,
     const int B,
-    const int C_in_per_q,
-    const int C_out_per_q,
+    const int C_in,
+    const int C_out,
     const int H_in,
     const int W_in,
     const int H_out,
@@ -67,79 +70,114 @@ __global__ void qconv_forward_kernel_hamilton(
     
     using acc_scalar_t = typename std::conditional<std::is_same<scalar_t, double>::value, double, float>::type;
 
-    const int Q = 4;
-    const int output_quaternion_elements = B * C_out_per_q * H_out * W_out;
+    const int output_elements = B * C_out * H_out * W_out;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (idx >= output_quaternion_elements) return;
+    if (idx >= output_elements) return;
 
     const int w_out = idx % W_out;
     const int h_out = (idx / W_out) % H_out;
-    const int c_out = (idx / (W_out * H_out)) % C_out_per_q;
-    const int batch = idx / (W_out * H_out * C_out_per_q);
+    const int c_out = (idx / (W_out * H_out)) % C_out;
+    const int batch = idx / (W_out * H_out * C_out);
 
-    const int C_in_per_q_grp = C_in_per_q / groups;
-    const int c_in_start = (c_out / (C_out_per_q / groups)) * C_in_per_q_grp;
-    const int c_in_end = c_in_start + C_in_per_q_grp;
+    const int C_in_grp = C_in / groups;
+    const int c_in_start = (c_out / (C_out / groups)) * C_in_grp;
+    const int c_in_end = c_in_start + C_in_grp;
 
-    // Use acc_scalar_t for accumulators
     acc_scalar_t sum_r_acc = bias_r ? static_cast<acc_scalar_t>(bias_r[c_out]) : 0.0;
     acc_scalar_t sum_i_acc = 0.0;
     acc_scalar_t sum_j_acc = 0.0;
     acc_scalar_t sum_k_acc = 0.0;
 
     for (int c_in = c_in_start; c_in < c_in_end; ++c_in) {
-        const int c_in_grp_offset = c_in - c_in_start;
         for (int kh = 0; kh < kH; ++kh) {
-            const int h_in = h_out * strideH - padH + kh * dilationH;
-            if (h_in < 0 || h_in >= H_in) continue;
             for (int kw = 0; kw < kW; ++kw) {
+                const int h_in = h_out * strideH - padH + kh * dilationH;
                 const int w_in = w_out * strideW - padW + kw * dilationW;
-                if (w_in < 0 || w_in >= W_in) continue;
 
-                const int base_offset_in = batch * (C_in_per_q * Q * H_in * W_in) +
-                                           c_in * (Q * H_in * W_in) +
-                                           h_in * W_in +
-                                           w_in;
+                if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+                    // Weight index calculation for grouped convolution
+                    const int weight_idx = ((c_out * C_in_grp + (c_in - c_in_start)) * kH + kh) * kW + kw;
+                    
+                    // Weights
+                    const acc_scalar_t wr = static_cast<acc_scalar_t>(weight_r[weight_idx]);
+                    const acc_scalar_t wi = static_cast<acc_scalar_t>(weight_i[weight_idx]);
+                    const acc_scalar_t wj = static_cast<acc_scalar_t>(weight_j[weight_idx]);
+                    const acc_scalar_t wk = static_cast<acc_scalar_t>(weight_k[weight_idx]);
 
-                const scalar_t xr = input[base_offset_in + 0 * (H_in * W_in)];
-                const scalar_t xi = input[base_offset_in + 1 * (H_in * W_in)];
-                const scalar_t xj = input[base_offset_in + 2 * (H_in * W_in)];
-                const scalar_t xk = input[base_offset_in + 3 * (H_in * W_in)];
+                    // Input index for BCHWQ
+                    const int input_base_idx = ((batch * C_in + c_in) * H_in + h_in) * W_in + w_in;
+                    
+                    // Inputs
+                    const acc_scalar_t xr = static_cast<acc_scalar_t>(input[input_base_idx * 4 + 0]);
+                    const acc_scalar_t xi = static_cast<acc_scalar_t>(input[input_base_idx * 4 + 1]);
+                    const acc_scalar_t xj = static_cast<acc_scalar_t>(input[input_base_idx * 4 + 2]);
+                    const acc_scalar_t xk = static_cast<acc_scalar_t>(input[input_base_idx * 4 + 3]);
 
-                const int base_offset_w = c_out * (C_in_per_q_grp * kH * kW) +
-                                          c_in_grp_offset * (kH * kW) +
-                                          kh * kW +
-                                          kw;
+                    // Right separable
+                    // sum_r_acc += static_cast<acc_scalar_t>(xr) * static_cast<acc_scalar_t>(wr);
+                    // sum_i_acc += static_cast<acc_scalar_t>(xi) * static_cast<acc_scalar_t>(wi);
+                    // sum_j_acc += static_cast<acc_scalar_t>(xj) * static_cast<acc_scalar_t>(wj);
+                    // sum_k_acc += static_cast<acc_scalar_t>(xk) * static_cast<acc_scalar_t>(wk);
 
-                const scalar_t wr = weight_r[base_offset_w];
-                const scalar_t wi = weight_i[base_offset_w];
-                const scalar_t wj = weight_j[base_offset_w];
-                const scalar_t wk = weight_k[base_offset_w];
+                    // Left separable
+                    sum_r_acc += static_cast<acc_scalar_t>(wr) * static_cast<acc_scalar_t>(xr);
+                    sum_i_acc += static_cast<acc_scalar_t>(wi) * static_cast<acc_scalar_t>(xi);
+                    sum_j_acc += static_cast<acc_scalar_t>(wj) * static_cast<acc_scalar_t>(xj);
+                    sum_k_acc += static_cast<acc_scalar_t>(wk) * static_cast<acc_scalar_t>(xk);
 
-                sum_r_acc += static_cast<acc_scalar_t>(xr) * static_cast<acc_scalar_t>(wr);
-                sum_i_acc += static_cast<acc_scalar_t>(xi) * static_cast<acc_scalar_t>(wi);
-                sum_j_acc += static_cast<acc_scalar_t>(xj) * static_cast<acc_scalar_t>(wj);
-                sum_k_acc += static_cast<acc_scalar_t>(xk) * static_cast<acc_scalar_t>(wk);
+                    // Right Hamilton
+                    // sum_r_acc += xr*wr - xi*wi - xj*wj - xk*wk;
+                    // sum_i_acc += xr*wi + xi*wr + xj*wk - xk*wj;
+                    // sum_j_acc += xr*wj - xi*wk + xj*wr + xk*wi;
+                    // sum_k_acc += xr*wk + xi*wj - xj*wi + xk*wr;
+
+                    // Left Hamilton
+                    // sum_r_acc += wr*xr - wi*xi - wj*xj - wk*xk;
+                    // sum_i_acc += wr*xi + wi*xr + wj*xk - wk*xj;
+                    // sum_j_acc += wr*xj - wi*xk + wj*xr + wk*xi;
+                    // sum_k_acc += wr*xk + wi*xj - wj*xi + wk*xr;
+                }
             }
         }
     }
 
-    // Final combination
+    // Final Hamilton combination
+    // acc_scalar_t final_r_acc = sum_r_acc;
+    // acc_scalar_t final_i_acc = sum_i_acc;
+    // acc_scalar_t final_j_acc = sum_j_acc;
+    // acc_scalar_t final_k_acc = sum_k_acc;
+
+    // Zhou separable forward calculation (CORRECTED)
     acc_scalar_t final_r_acc = sum_r_acc + sum_i_acc + sum_j_acc + sum_k_acc;
-    acc_scalar_t final_i_acc = -sum_r_acc + sum_i_acc + sum_j_acc - sum_k_acc;
-    acc_scalar_t final_j_acc = -sum_r_acc - sum_i_acc + sum_j_acc + sum_k_acc;
-    acc_scalar_t final_k_acc = -sum_r_acc + sum_i_acc - sum_j_acc + sum_k_acc;
+    acc_scalar_t final_i_acc = - sum_i_acc + sum_r_acc + sum_k_acc - sum_j_acc;
+    acc_scalar_t final_j_acc = - sum_j_acc - sum_k_acc + sum_r_acc + sum_i_acc;
+    acc_scalar_t final_k_acc = - sum_k_acc + sum_j_acc - sum_i_acc + sum_r_acc;
 
-    const int base_offset_out = batch * (C_out_per_q * Q * H_out * W_out) +
-                                c_out * (Q * H_out * W_out) +
-                                h_out * W_out +
-                                w_out;
+    // Zhou left separable forward calculation (INCORRECT)
+    // acc_scalar_t final_r_acc = sum_r_acc + sum_i_acc + sum_j_acc + sum_k_acc;
+    // acc_scalar_t final_i_acc = sum_i_acc - sum_r_acc - sum_k_acc + sum_j_acc;
+    // acc_scalar_t final_j_acc = sum_j_acc + sum_k_acc - sum_r_acc - sum_i_acc;
+    // acc_scalar_t final_k_acc = sum_k_acc - sum_j_acc + sum_i_acc - sum_r_acc;
 
-    output[base_offset_out + 0 * (H_out * W_out)] = static_cast<scalar_t>(final_r_acc);
-    output[base_offset_out + 1 * (H_out * W_out)] = static_cast<scalar_t>(final_i_acc);
-    output[base_offset_out + 2 * (H_out * W_out)] = static_cast<scalar_t>(final_j_acc);
-    output[base_offset_out + 3 * (H_out * W_out)] = static_cast<scalar_t>(final_k_acc);
+    // Right separable
+    // acc_scalar_t final_r_acc = sum_r_acc - sum_i_acc - sum_j_acc - sum_k_acc;
+    // acc_scalar_t final_i_acc = sum_i_acc + sum_r_acc - sum_k_acc + sum_j_acc;
+    // acc_scalar_t final_j_acc = sum_j_acc + sum_k_acc + sum_r_acc - sum_i_acc;
+    // acc_scalar_t final_k_acc = sum_k_acc - sum_j_acc + sum_i_acc + sum_r_acc;
+
+    // Left separable
+    // acc_scalar_t final_r_acc = sum_r_acc - sum_i_acc - sum_j_acc - sum_k_acc;
+    // acc_scalar_t final_i_acc = sum_i_acc + sum_r_acc + sum_k_acc - sum_j_acc;
+    // acc_scalar_t final_j_acc = sum_j_acc - sum_k_acc + sum_r_acc + sum_i_acc;
+    // acc_scalar_t final_k_acc = sum_k_acc + sum_j_acc - sum_i_acc + sum_r_acc;
+
+    // BCHWQ output
+    const int output_base_idx = ((batch * C_out + c_out) * H_out + h_out) * W_out + w_out;
+    output[output_base_idx * 4 + 0] = static_cast<scalar_t>(final_r_acc);
+    output[output_base_idx * 4 + 1] = static_cast<scalar_t>(final_i_acc);
+    output[output_base_idx * 4 + 2] = static_cast<scalar_t>(final_j_acc);
+    output[output_base_idx * 4 + 3] = static_cast<scalar_t>(final_k_acc);
 }
 
 
@@ -152,8 +190,8 @@ __global__ void qconv_backward_input_kernel(
     const scalar_t* __restrict__ weight_j,
     const scalar_t* __restrict__ weight_k,
     const int B,
-    const int C_in_per_q,
-    const int C_out_per_q,
+    const int C_in,
+    const int C_out,
     const int H_in,
     const int W_in,
     const int H_out,
@@ -170,86 +208,106 @@ __global__ void qconv_backward_input_kernel(
 
     using acc_scalar_t = typename std::conditional<std::is_same<scalar_t, double>::value, double, float>::type;
     
-    const int Q = 4;
-    const int total_input_elements = B * C_in_per_q * H_in * W_in;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_elements = B * C_in * H_in * W_in;
     
-    if (idx >= total_input_elements) return;
+    if (idx >= total_elements) return;
     
-    // Decode position
     const int w_in = idx % W_in;
     const int h_in = (idx / W_in) % H_in;
-    const int c_in = (idx / (W_in * H_in)) % C_in_per_q;
-    const int batch = idx / (W_in * H_in * C_in_per_q);
+    const int c_in = (idx / (W_in * H_in)) % C_in;
+    const int batch = idx / (W_in * H_in * C_in);
     
-    // Group calculations
-    const int C_out_per_q_grp = C_out_per_q / groups;
-    const int C_in_per_q_grp = C_in_per_q / groups;
-    const int group = c_in / C_in_per_q_grp;
-    const int c_out_start = group * C_out_per_q_grp;
-    const int c_out_end = c_out_start + C_out_per_q_grp;
-    const int c_in_grp = c_in % C_in_per_q_grp;
+    const int group = c_in / (C_in / groups);
+    const int C_out_grp = C_out / groups;
+    const int c_out_start = group * C_out_grp;
+    const int c_out_end = c_out_start + C_out_grp;
+    const int C_in_grp = C_in / groups;
     
-    // Accumulators with higher precision
     acc_scalar_t grad_xr = 0, grad_xi = 0, grad_xj = 0, grad_xk = 0;
     
     // Process each output channel
     for (int c_out = c_out_start; c_out < c_out_end; ++c_out) {
         for (int kh = 0; kh < kH; ++kh) {
             for (int kw = 0; kw < kW; ++kw) {
-                // Calculate corresponding output position
-                const int h_out_base = h_in + padH - kh * dilationH;
-                const int w_out_base = w_in + padW - kw * dilationW;
+                const int h_out = (h_in + padH - kh * dilationH);
+                const int w_out = (w_in + padW - kw * dilationW);
                 
-                if (h_out_base % strideH != 0 || w_out_base % strideW != 0) continue;
+                if (h_out % strideH == 0 && w_out % strideW == 0) {
+                    const int h_out_idx = h_out / strideH;
+                    const int w_out_idx = w_out / strideW;
+                    
+                    if (h_out_idx >= 0 && h_out_idx < H_out && w_out_idx >= 0 && w_out_idx < W_out) {
+                        // Grad output index for BCHWQ layout
+                        const int grad_out_base_idx = ((batch * C_out + c_out) * H_out + h_out_idx) * W_out + w_out_idx;
+                        
+                        const acc_scalar_t grad_r = static_cast<acc_scalar_t>(grad_output[grad_out_base_idx * 4 + 0]);
+                        const acc_scalar_t grad_i = static_cast<acc_scalar_t>(grad_output[grad_out_base_idx * 4 + 1]);
+                        const acc_scalar_t grad_j = static_cast<acc_scalar_t>(grad_output[grad_out_base_idx * 4 + 2]);
+                        const acc_scalar_t grad_k = static_cast<acc_scalar_t>(grad_output[grad_out_base_idx * 4 + 3]);
+                        
+                        const int weight_idx = ((c_out * C_in_grp + (c_in - group * C_in_grp)) * kH + kh) * kW + kw;
+                        
+                        const acc_scalar_t wr = static_cast<acc_scalar_t>(weight_r[weight_idx]);
+                        const acc_scalar_t wi = static_cast<acc_scalar_t>(weight_i[weight_idx]);
+                        const acc_scalar_t wj = static_cast<acc_scalar_t>(weight_j[weight_idx]);
+                        const acc_scalar_t wk = static_cast<acc_scalar_t>(weight_k[weight_idx]);
                 
-                const int h_out = h_out_base / strideH;
-                const int w_out = w_out_base / strideW;
-                
-                if (h_out < 0 || h_out >= H_out || w_out < 0 || w_out >= W_out) continue;
-                
-                // Load gradients - coalesced access
-                const int grad_base = ((batch * C_out_per_q + c_out) * Q) * H_out * W_out;
-                const int grad_offset = h_out * W_out + w_out;
-                
-                const scalar_t grad_r = grad_output[grad_base + 0 * H_out * W_out + grad_offset];
-                const scalar_t grad_i = grad_output[grad_base + 1 * H_out * W_out + grad_offset];
-                const scalar_t grad_j = grad_output[grad_base + 2 * H_out * W_out + grad_offset];
-                const scalar_t grad_k = grad_output[grad_base + 3 * H_out * W_out + grad_offset];
-                
-                // Load weights - coalesced access
-                const int weight_idx = ((c_out * C_in_per_q_grp + c_in_grp) * kH + kh) * kW + kw;
-                const scalar_t wr = weight_r[weight_idx];
-                const scalar_t wi = weight_i[weight_idx];
-                const scalar_t wj = weight_j[weight_idx];
-                const scalar_t wk = weight_k[weight_idx];
-                
-                // Hamilton product backward (conjugate transpose)
-                // grad_xr += static_cast<acc_scalar_t>(grad_r * wr - grad_i * wr - grad_j * wr - grad_k * wr);
-                // grad_xi += static_cast<acc_scalar_t>(grad_r * wi + grad_i * wi - grad_j * wi + grad_k * wi);
-                // grad_xj += static_cast<acc_scalar_t>(grad_r * wj + grad_i * wj + grad_j * wj - grad_k * wj);
-                // grad_xk += static_cast<acc_scalar_t>(grad_r * wk - grad_i * wk + grad_j * wk + grad_k * wk);
 
-                const acc_scalar_t combined_grad_for_r = grad_r - grad_i - grad_j - grad_k;
-                const acc_scalar_t combined_grad_for_i = grad_r + grad_i - grad_j + grad_k;
-                const acc_scalar_t combined_grad_for_j = grad_r + grad_i + grad_j - grad_k;
-                const acc_scalar_t combined_grad_for_k = grad_r - grad_i + grad_j + grad_k;
-                
-                grad_xr += combined_grad_for_r * wr;
-                grad_xi += combined_grad_for_i * wi;
-                grad_xj += combined_grad_for_j * wj;
-                grad_xk += combined_grad_for_k * wk;
+                        // Left separable
+                        // const acc_scalar_t combined_grad_for_r = grad_r + grad_i + grad_j + grad_k;
+                        // const acc_scalar_t combined_grad_for_i = grad_i - grad_r - grad_k + grad_j;
+                        // const acc_scalar_t combined_grad_for_j = grad_j + grad_k - grad_r - grad_i;
+                        // const acc_scalar_t combined_grad_for_k = grad_k - grad_j + grad_i - grad_r;                
+                    
+                        // Right separable 
+                        // const acc_scalar_t combined_grad_for_r = grad_r + grad_i + grad_j + grad_k;
+                        // const acc_scalar_t combined_grad_for_i = grad_i - grad_r + grad_k - grad_j;
+                        // const acc_scalar_t combined_grad_for_j = grad_j - grad_k - grad_r + grad_i;
+                        // const acc_scalar_t combined_grad_for_k = grad_k + grad_j - grad_i - grad_r;
+
+
+
+                        // Left Conj separable
+                        // const acc_scalar_t combined_grad_for_r = grad_r - grad_i - grad_j - grad_k;
+                        // const acc_scalar_t combined_grad_for_i = grad_i + grad_r + grad_k - grad_j;
+                        // const acc_scalar_t combined_grad_for_j = grad_j - grad_k + grad_r + grad_i;
+                        // const acc_scalar_t combined_grad_for_k = grad_k + grad_j - grad_i + grad_r;                
+                        
+                        // Correct Left Conj separable 
+                        grad_xr += (grad_r + grad_i + grad_j + grad_k)  *wr;
+                        grad_xi += (- grad_i + grad_r - grad_k + grad_j)*wi;
+                        grad_xj += (- grad_j + grad_k + grad_r - grad_i)*wj;
+                        grad_xk += (- grad_k - grad_j + grad_i + grad_r)*wk;
+
+                        // Combination
+                        // grad_xr += combined_grad_for_r * wr;
+                        // grad_xi += combined_grad_for_i * wi;
+                        // grad_xj += combined_grad_for_j * wj;
+                        // grad_xk += combined_grad_for_k * wk;
+
+                        // Hamilton Left Mult (w*x)
+                        // grad_xr += (grad_r * wr + grad_i * wi + grad_j * wj + grad_k * wk);
+                        // grad_xi += (- grad_r * wi + grad_i * wr + grad_j * wk - grad_k * wj);
+                        // grad_xj += (- grad_r * wj - grad_i * wk + grad_j * wr + grad_k * wi);
+                        // grad_xk += (- grad_r * wk + grad_i * wj - grad_j * wi + grad_k * wr); 
+
+                        // Hamilton Right Mult  (x*w)
+                        // grad_xr += (grad_r * wr + grad_i * wi + grad_j * wj + grad_k * wk);
+                        // grad_xi += (- grad_r * wi + grad_i * wr - grad_j * wk + grad_k * wj);
+                        // grad_xj += (- grad_r * wj + grad_i * wk + grad_j * wr - grad_k * wi);
+                        // grad_xk += (- grad_r * wk - grad_i * wj + grad_j * wi + grad_k * wr); 
+                    }
+                }
             }
         }
     }
-    
-    const int input_base = ((batch * C_in_per_q + c_in) * Q) * H_in * W_in;
-    const int input_offset = h_in * W_in + w_in;
-    
-    grad_input[input_base + 0 * H_in * W_in + input_offset] = static_cast<scalar_t>(grad_xr);
-    grad_input[input_base + 1 * H_in * W_in + input_offset] = static_cast<scalar_t>(grad_xi);
-    grad_input[input_base + 2 * H_in * W_in + input_offset] = static_cast<scalar_t>(grad_xj);
-    grad_input[input_base + 3 * H_in * W_in + input_offset] = static_cast<scalar_t>(grad_xk);
+    // BCHWQ output
+    const int grad_input_base_idx = idx;
+    grad_input[grad_input_base_idx * 4 + 0] = static_cast<scalar_t>(grad_xr);
+    grad_input[grad_input_base_idx * 4 + 1] = static_cast<scalar_t>(grad_xi);
+    grad_input[grad_input_base_idx * 4 + 2] = static_cast<scalar_t>(grad_xj);
+    grad_input[grad_input_base_idx * 4 + 3] = static_cast<scalar_t>(grad_xk);
 }
 
 template <typename scalar_t>
@@ -261,8 +319,8 @@ __global__ void qconv_backward_weight_kernel(
     const scalar_t* __restrict__ grad_output,
     const scalar_t* __restrict__ input,
     const int B,
-    const int C_in_per_q,
-    const int C_out_per_q,
+    const int C_in,
+    const int C_out,
     const int H_in,
     const int W_in,
     const int H_out,
@@ -279,69 +337,94 @@ __global__ void qconv_backward_weight_kernel(
 
     using acc_scalar_t = typename std::conditional<std::is_same<scalar_t, double>::value, double, float>::type;
     
-    const int Q = 4;
-    const int C_in_per_q_grp = C_in_per_q / groups;
-    
-    // One block per weight element
-    const int total_weights = C_out_per_q * C_in_per_q_grp * kH * kW;
     const int weight_idx = blockIdx.x;
+    const int C_in_grp = C_in / groups;
+    const int total_weights = C_out * C_in_grp * kH * kW;
     
     if (weight_idx >= total_weights) return;
     
-    // Decode weight position
     const int kw = weight_idx % kW;
     const int kh = (weight_idx / kW) % kH;
-    const int c_in_grp = (weight_idx / (kW * kH)) % C_in_per_q_grp;
-    const int c_out = weight_idx / (kW * kH * C_in_per_q_grp);
+    const int c_in = (weight_idx / (kW * kH)) % C_in_grp;
+    const int c_out = weight_idx / (kW * kH * C_in_grp);
     
-    const int group = c_out / (C_out_per_q / groups);
-    const int c_in = group * C_in_per_q_grp + c_in_grp;
+    const int group = c_out / (C_out / groups);
+    const int global_c_in = group * C_in_grp + c_in;
+    
+    __shared__ acc_scalar_t shared_grads[4][32];
     
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
     
-    // Each thread processes multiple batch/spatial positions
     acc_scalar_t local_grad_r = 0, local_grad_i = 0, local_grad_j = 0, local_grad_k = 0;
     
-    // Process spatial locations in parallel
-    const int total_spatial = B * H_out * W_out;
-    for (int spatial_idx = tid; spatial_idx < total_spatial; spatial_idx += num_threads) {
-        const int w_out = spatial_idx % W_out;
-        const int h_out = (spatial_idx / W_out) % H_out;
-        const int b = spatial_idx / (W_out * H_out);
+    const int total_pixels = B * H_out * W_out;
+
+    for (int idx = tid; idx < total_pixels; idx += num_threads) {
+        const int w_out = idx % W_out;
+        const int h_out = (idx / W_out) % H_out;
+        const int batch = idx / (W_out * H_out);
         
-        // Calculate input position
         const int h_in = h_out * strideH - padH + kh * dilationH;
         const int w_in = w_out * strideW - padW + kw * dilationW;
         
-        if (h_in < 0 || h_in >= H_in || w_in < 0 || w_in >= W_in) continue;
-        
-        // Load input values
-        const int input_base = ((b * C_in_per_q + c_in) * Q) * H_in * W_in;
-        const int input_offset = h_in * W_in + w_in;
-        
-        const scalar_t xr = input[input_base + 0 * H_in * W_in + input_offset];
-        const scalar_t xi = input[input_base + 1 * H_in * W_in + input_offset];
-        const scalar_t xj = input[input_base + 2 * H_in * W_in + input_offset];
-        const scalar_t xk = input[input_base + 3 * H_in * W_in + input_offset];
-        
-        // Load gradient values
-        const int grad_base = ((b * C_out_per_q + c_out) * Q) * H_out * W_out;
-        const int grad_offset = h_out * W_out + w_out;
-        
-        const scalar_t grad_r = grad_output[grad_base + 0 * H_out * W_out + grad_offset];
-        const scalar_t grad_i = grad_output[grad_base + 1 * H_out * W_out + grad_offset];
-        const scalar_t grad_j = grad_output[grad_base + 2 * H_out * W_out + grad_offset];
-        const scalar_t grad_k = grad_output[grad_base + 3 * H_out * W_out + grad_offset];
-        
-        // Accumulate weight gradients
-        local_grad_r += (grad_r - grad_i - grad_j - grad_k) * xr;
-        local_grad_i += (grad_r + grad_i + grad_j - grad_k) * xi;
-        local_grad_j += (grad_r + grad_i + grad_j + grad_k) * xj;
-        local_grad_k += (grad_r - grad_i + grad_j + grad_k) * xk;
+        if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+            // Grad output index for BCHWQ layout
+            const int grad_out_base_idx = ((batch * C_out + c_out) * H_out + h_out) * W_out + w_out;
+            
+            const acc_scalar_t grad_r = static_cast<acc_scalar_t>(grad_output[grad_out_base_idx * 4 + 0]);
+            const acc_scalar_t grad_i = static_cast<acc_scalar_t>(grad_output[grad_out_base_idx * 4 + 1]);
+            const acc_scalar_t grad_j = static_cast<acc_scalar_t>(grad_output[grad_out_base_idx * 4 + 2]);
+            const acc_scalar_t grad_k = static_cast<acc_scalar_t>(grad_output[grad_out_base_idx * 4 + 3]);
+            
+            // Input index for BCHWQ layout
+            const int input_base_idx = ((batch * C_in + global_c_in) * H_in + h_in) * W_in + w_in;
+            
+            const acc_scalar_t xr = static_cast<acc_scalar_t>(input[input_base_idx * 4 + 0]);
+            const acc_scalar_t xi = static_cast<acc_scalar_t>(input[input_base_idx * 4 + 1]);
+            const acc_scalar_t xj = static_cast<acc_scalar_t>(input[input_base_idx * 4 + 2]);
+            const acc_scalar_t xk = static_cast<acc_scalar_t>(input[input_base_idx * 4 + 3]);
+
+            // Left Conj separable
+            // local_grad_r += (grad_r - grad_i - grad_j - grad_k) * xr;
+            // local_grad_i += (grad_i + grad_r + grad_k - grad_j) * xi;
+            // local_grad_j += (grad_j - grad_k + grad_r + grad_i) * xj;
+            // local_grad_k += (grad_k + grad_j - grad_i + grad_r) * xk;                
+            
+            // Correct Left Conj separable 
+            local_grad_r += (grad_r + grad_i + grad_j + grad_k) * xr;
+            local_grad_i += (- grad_i + grad_r - grad_k + grad_j) * xi;
+            local_grad_j += (- grad_j + grad_k + grad_r - grad_i) * xj;
+            local_grad_k += (- grad_k - grad_j + grad_i + grad_r) * xk;
+
+            // Left separable 
+            // local_grad_r += (grad_r + grad_i + grad_j + grad_k) * xr;
+            // local_grad_i += (grad_i - grad_r - grad_k + grad_j) * xi;
+            // local_grad_j += (grad_j + grad_k - grad_r - grad_i) * xj;
+            // local_grad_k += (grad_k - grad_j + grad_i - grad_r) * xk;
+            
+            // Right separable
+            // local_grad_r += (grad_r + grad_i + grad_j + grad_k) * xr;
+            // local_grad_i += (grad_i - grad_r + grad_k - grad_j) * xi;
+            // local_grad_j += (grad_j - grad_k - grad_r + grad_i) * xj;
+            // local_grad_k += (grad_k + grad_j - grad_i - grad_r) * xk;
+
+            // Hamilton left mult
+            // local_grad_r += (grad_r * xr + grad_i * xi + grad_j * xj + grad_k * xk);
+            // local_grad_i += (- grad_r * xi + grad_i * xr - grad_j * xk + grad_k * xj);
+            // local_grad_j += (- grad_r * xj + grad_i * xk + grad_j * xr - grad_k * xi);
+            // local_grad_k += (- grad_r * xk - grad_i * xj + grad_j * xi + grad_k * xr);
+
+            // Hamilton right mult 
+            // local_grad_r += (grad_r * xr + grad_i * xi + grad_j * xj + grad_k * xk);
+            // local_grad_i += (- grad_r * xi + grad_i * xr + grad_j * xk - grad_k * xj);
+            // local_grad_j += (- grad_r * xj - grad_i * xk + grad_j * xr + grad_k * xi);
+            // local_grad_k += (- grad_r * xk + grad_i * xj - grad_j * xi + grad_k * xr);
+        }
+
     }
     
-    // Warp-level reduction
+    // Warp reduction
     for (int offset = 16; offset > 0; offset /= 2) {
         local_grad_r += __shfl_down_sync(0xffffffff, local_grad_r, offset);
         local_grad_i += __shfl_down_sync(0xffffffff, local_grad_i, offset);
@@ -349,8 +432,7 @@ __global__ void qconv_backward_weight_kernel(
         local_grad_k += __shfl_down_sync(0xffffffff, local_grad_k, offset);
     }
     
-    // Block-level reduction using shared memory
-    __shared__ acc_scalar_t shared_grads[4][32];
+
     
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
@@ -363,7 +445,7 @@ __global__ void qconv_backward_weight_kernel(
     }
     __syncthreads();
     
-    // Final reduction by first warp
+    // Final reduction
     if (warp_id == 0) {
         const int num_warps = (num_threads + 31) / 32;
         acc_scalar_t final_r = (lane_id < num_warps) ? shared_grads[0][lane_id] : 0;
@@ -392,14 +474,14 @@ __global__ void qconv_backward_bias_kernel(
     scalar_t* __restrict__ grad_bias,
     const scalar_t* __restrict__ grad_output,
     const int B,
-    const int C_out_per_q,
+    const int C_out,
     const int H_out,
     const int W_out) {
     
     using acc_scalar_t = typename std::conditional<std::is_same<scalar_t, double>::value, double, float>::type;
     
     const int c_out = blockIdx.x;
-    if (c_out >= C_out_per_q) return;
+    if (c_out >= C_out) return;
     
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
@@ -409,9 +491,13 @@ __global__ void qconv_backward_bias_kernel(
     // Sum over batch and spatial dimensions for the real component only
     const int total_elements = B * H_out * W_out;
     for (int idx = tid; idx < total_elements; idx += num_threads) {
-        const int offset = ((idx / (H_out * W_out)) * C_out_per_q + c_out) * 4 * H_out * W_out + 
-                          (idx % (H_out * W_out));
-        local_sum += static_cast<acc_scalar_t>(grad_output[offset]);
+        const int w_out = idx % W_out;
+        const int h_out = (idx / W_out) % H_out;
+        const int batch = idx / (H_out * W_out);
+        
+        // BCHWQ output
+        const int grad_out_idx = ((batch * C_out + c_out) * H_out + h_out) * W_out + w_out;
+        local_sum += static_cast<acc_scalar_t>(grad_output[grad_out_idx * 4 + 0]);
     }
     
     // Warp reduction
@@ -457,17 +543,17 @@ std::vector<torch::Tensor> qconv_backward_cuda(
     int64_t groups) {
     
     const auto B = input.size(0);
-    const auto C_in_per_q = input.size(1);
-    const auto H_in = input.size(3);
-    const auto W_in = input.size(4);
+    const auto C_in = input.size(1);
+    const auto H_in = input.size(2);
+    const auto W_in = input.size(3);
     
-    const auto C_out_per_q = weight_r.size(0);
-    const auto C_in_per_q_grp = weight_r.size(1);
+    const auto C_out = weight_r.size(0);
+    const auto C_in_grp = weight_r.size(1);
     const auto kH = weight_r.size(2);
     const auto kW = weight_r.size(3);
     
-    const auto H_out = grad_output.size(3);
-    const auto W_out = grad_output.size(4);
+    const auto H_out = grad_output.size(2);
+    const auto W_out = grad_output.size(3);
     
     // Pre-zero gradients to avoid initialization overhead
     auto grad_input = torch::zeros_like(input);
@@ -475,68 +561,116 @@ std::vector<torch::Tensor> qconv_backward_cuda(
     auto grad_weight_i = torch::zeros_like(weight_i);
     auto grad_weight_j = torch::zeros_like(weight_j);
     auto grad_weight_k = torch::zeros_like(weight_k);
-    auto grad_bias = bias_defined ? torch::zeros({C_out_per_q}, grad_output.options()) : torch::Tensor();
+    auto grad_bias = bias_defined ? torch::zeros({C_out}, grad_output.options()) : torch::Tensor();
     
     // Ensure contiguous tensors
-    grad_output = grad_output.contiguous();
-    input = input.contiguous();
-    weight_r = weight_r.contiguous();
-    weight_i = weight_i.contiguous();
-    weight_j = weight_j.contiguous();
-    weight_k = weight_k.contiguous();
+    // grad_output = grad_output.contiguous();
+    // input = input.contiguous();
+    // weight_r = weight_r.contiguous();
+    // weight_i = weight_i.contiguous();
+    // weight_j = weight_j.contiguous();
+    // weight_k = weight_k.contiguous();
     
     // Backward input
-    {
-        const int threads = 256;
-        const int total_input_elements = B * C_in_per_q * H_in * W_in;
-        const int blocks = (total_input_elements + threads - 1) / threads;
+//     {
+//         const int threads = 256;
+//         const int total_input_elements = B * C_in_per_q * H_in * W_in;
+//         const int blocks = (total_input_elements + threads - 1) / threads;
         
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "qconv_backward_input", ([&] {
-            qconv_backward_input_kernel<scalar_t><<<blocks, threads>>>(
-                grad_input.data_ptr<scalar_t>(),
-                grad_output.data_ptr<scalar_t>(),
-                weight_r.data_ptr<scalar_t>(),
-                weight_i.data_ptr<scalar_t>(),
-                weight_j.data_ptr<scalar_t>(),
-                weight_k.data_ptr<scalar_t>(),
-                B, C_in_per_q, C_out_per_q, H_in, W_in, H_out, W_out,
-                kH, kW, stride[0], stride[1], padding[0], padding[1],
-                dilation[0], dilation[1], groups
-            );
-        }));
-    }
+//         AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "qconv_backward_input", ([&] {
+//             qconv_backward_input_kernel<scalar_t><<<blocks, threads>>>(
+//                 grad_input.data_ptr<scalar_t>(),
+//                 grad_output.data_ptr<scalar_t>(),
+//                 weight_r.data_ptr<scalar_t>(),
+//                 weight_i.data_ptr<scalar_t>(),
+//                 weight_j.data_ptr<scalar_t>(),
+//                 weight_k.data_ptr<scalar_t>(),
+//                 B, C_in_per_q, C_out_per_q, H_in, W_in, H_out, W_out,
+//                 kH, kW, stride[0], stride[1], padding[0], padding[1],
+//                 dilation[0], dilation[1], groups
+//             );
+//         }));
+//     }
     
-    // Backward weight has one block per weight
-    {
-        const int threads = 256;
-        const int total_weights = C_out_per_q * C_in_per_q_grp * kH * kW;
-        const int blocks = total_weights;
+//     // Backward weight has one block per weight
+//     {
+//         const int threads = 256;
+//         const int total_weights = C_out_per_q * C_in_per_q_grp * kH * kW;
+//         const int blocks = total_weights;
         
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "qconv_backward_weight", ([&] {
-            qconv_backward_weight_kernel<scalar_t><<<blocks, threads>>>(
-                grad_weight_r.data_ptr<scalar_t>(),
-                grad_weight_i.data_ptr<scalar_t>(),
-                grad_weight_j.data_ptr<scalar_t>(),
-                grad_weight_k.data_ptr<scalar_t>(),
-                grad_output.data_ptr<scalar_t>(),
-                input.data_ptr<scalar_t>(),
-                B, C_in_per_q, C_out_per_q, H_in, W_in, H_out, W_out,
-                kH, kW, stride[0], stride[1], padding[0], padding[1],
-                dilation[0], dilation[1], groups
-            );
-        }));
-    }
+//         AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "qconv_backward_weight", ([&] {
+//             qconv_backward_weight_kernel<scalar_t><<<blocks, threads>>>(
+//                 grad_weight_r.data_ptr<scalar_t>(),
+//                 grad_weight_i.data_ptr<scalar_t>(),
+//                 grad_weight_j.data_ptr<scalar_t>(),
+//                 grad_weight_k.data_ptr<scalar_t>(),
+//                 grad_output.data_ptr<scalar_t>(),
+//                 input.data_ptr<scalar_t>(),
+//                 B, C_in_per_q, C_out_per_q, H_in, W_in, H_out, W_out,
+//                 kH, kW, stride[0], stride[1], padding[0], padding[1],
+//                 dilation[0], dilation[1], groups
+//             );
+//         }));
+//     }
     
-    // Backward bias has one block per output channel
+//     // Backward bias has one block per output channel
+//     if (bias_defined) {
+//         const int threads = 256;
+//         const int blocks = C_out_per_q;
+        
+//         AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "qconv_backward_bias", ([&] {
+//             qconv_backward_bias_kernel<scalar_t><<<blocks, threads>>>(
+//                 grad_bias.data_ptr<scalar_t>(),
+//                 grad_output.data_ptr<scalar_t>(),
+//                 B, C_out_per_q, H_out, W_out
+//             );
+//         }));
+//     }
+    
+//     return {grad_input, grad_weight_r, grad_weight_i, grad_weight_j, grad_weight_k, grad_bias};
+// }
+    const int threads = 256;
+    
+    // Gradient w.r.t. input
+    const int input_blocks = (B * C_in * H_in * W_in + threads - 1) / threads;
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_output.scalar_type(), "qconv_backward_input", ([&] {
+        qconv_backward_input_kernel<scalar_t><<<input_blocks, threads>>>(
+            grad_input.data_ptr<scalar_t>(),
+            grad_output.data_ptr<scalar_t>(),
+            weight_r.data_ptr<scalar_t>(),
+            weight_i.data_ptr<scalar_t>(),
+            weight_j.data_ptr<scalar_t>(),
+            weight_k.data_ptr<scalar_t>(),
+            B, C_in, C_out, H_in, W_in, H_out, W_out,
+            kH, kW, stride[0], stride[1], padding[0], padding[1],
+            dilation[0], dilation[1], groups
+        );
+    }));
+    
+    // Gradient w.r.t. weights
+    const int weight_blocks = C_out * C_in_grp * kH * kW;
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_output.scalar_type(), "qconv_backward_weight", ([&] {
+        qconv_backward_weight_kernel<scalar_t><<<weight_blocks, threads>>>(
+            grad_weight_r.data_ptr<scalar_t>(),
+            grad_weight_i.data_ptr<scalar_t>(),
+            grad_weight_j.data_ptr<scalar_t>(),
+            grad_weight_k.data_ptr<scalar_t>(),
+            grad_output.data_ptr<scalar_t>(),
+            input.data_ptr<scalar_t>(),
+            B, C_in, C_out, H_in, W_in, H_out, W_out,
+            kH, kW, stride[0], stride[1], padding[0], padding[1],
+            dilation[0], dilation[1], groups
+        );
+    }));
+    
+    // Gradient w.r.t. bias
     if (bias_defined) {
-        const int threads = 256;
-        const int blocks = C_out_per_q;
-        
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "qconv_backward_bias", ([&] {
-            qconv_backward_bias_kernel<scalar_t><<<blocks, threads>>>(
+        const int bias_threads = 256;
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_output.scalar_type(), "qconv_backward_bias", ([&] {
+            qconv_backward_bias_kernel<scalar_t><<<C_out, bias_threads>>>(
                 grad_bias.data_ptr<scalar_t>(),
                 grad_output.data_ptr<scalar_t>(),
-                B, C_out_per_q, H_out, W_out
+                B, C_out, H_out, W_out
             );
         }));
     }
@@ -546,39 +680,33 @@ std::vector<torch::Tensor> qconv_backward_cuda(
 
 
 
-
 torch::Tensor iqbn_forward_cuda(
-    torch::Tensor input,        // [B, C_per_q, Q, H, W]
-    torch::Tensor gamma,        // [C_per_q, Q]
-    torch::Tensor beta,         // [C_per_q, Q]
-    torch::Tensor running_mean, // [C_per_q, Q]
-    torch::Tensor running_var,  // [C_per_q, Q]
+    torch::Tensor input,        // [B, C, H, W, Q]
+    torch::Tensor gamma,        // [C, Q=4]
+    torch::Tensor beta,         // [C, Q=4]
+    torch::Tensor running_mean, // [C, Q=4]
+    torch::Tensor running_var,  // [C, Q=4]
     float eps) {
 
     TORCH_CHECK(input.dim() == 5, "iqbn_forward_cuda expects 5D input");
-    TORCH_CHECK(gamma.dim() == 2, "iqbn_forward_cuda expects 2D gamma");
-    TORCH_CHECK(beta.dim() == 2, "iqbn_forward_cuda expects 2D beta");
-    TORCH_CHECK(running_mean.dim() == 2, "iqbn_forward_cuda expects 2D running_mean");
-    TORCH_CHECK(running_var.dim() == 2, "iqbn_forward_cuda expects 2D running_var");
-
-    const auto N = input.size(0);
-    const auto C_per_q = input.size(1);
-    const auto Q = input.size(2);
-    const auto H = input.size(3);
-    const auto W = input.size(4);
+    TORCH_CHECK(input.size(4) == 4, "Input quaternion dimension (dim 4) must be 4");
+    
+    const auto B = input.size(0);
+    const auto C = input.size(1);
+    const auto H = input.size(2);
+    const auto W = input.size(3);
     const auto HW = H * W;
 
-    TORCH_CHECK(Q == 4, "Input quaternion dimension (dim 2) must be 4");
-    TORCH_CHECK(gamma.size(0) == C_per_q && gamma.size(1) == Q, "gamma shape mismatch");
-    TORCH_CHECK(beta.size(0) == C_per_q && beta.size(1) == Q, "beta shape mismatch");
-    TORCH_CHECK(running_mean.size(0) == C_per_q && running_mean.size(1) == Q, "running_mean shape mismatch");
-    TORCH_CHECK(running_var.size(0) == C_per_q && running_var.size(1) == Q, "running_var shape mismatch");
-
+    // Check parameter shapes
+    TORCH_CHECK(gamma.size(0) == C && gamma.size(1) == 4, "gamma shape mismatch");
+    TORCH_CHECK(beta.size(0) == C && beta.size(1) == 4, "beta shape mismatch");
+    TORCH_CHECK(running_mean.size(0) == C && running_mean.size(1) == 4, "running_mean shape mismatch");
+    TORCH_CHECK(running_var.size(0) == C && running_var.size(1) == 4, "running_var shape mismatch");
 
     auto output = torch::empty_like(input);
 
     const int threads = 256;
-    const int total_elements = N * C_per_q * Q * HW;
+    const int total_elements = B * C * HW * 4;
     const int blocks = (total_elements + threads - 1) / threads;
 
     input = input.contiguous();
@@ -586,7 +714,6 @@ torch::Tensor iqbn_forward_cuda(
     beta = beta.contiguous();
     running_mean = running_mean.contiguous();
     running_var = running_var.contiguous();
-
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "iqbn_forward_cuda", ([&] {
         iqbn_forward_kernel<scalar_t><<<blocks, threads>>>(
@@ -596,81 +723,61 @@ torch::Tensor iqbn_forward_cuda(
             beta.data_ptr<scalar_t>(),
             running_mean.data_ptr<scalar_t>(),
             running_var.data_ptr<scalar_t>(),
-            N, C_per_q, Q, HW, eps
+            B, C, HW, eps
         );
     }));
 
     return output;
 }
 
+
+
 torch::Tensor qconv_forward_cuda(
-    torch::Tensor input,        // [B, C_in_per_q, Q=4, H_in, W_in]
-    torch::Tensor weight_r,     // [C_out_per_q, C_in_per_q_grp, kH, kW]
-    torch::Tensor weight_i,     // [C_out_per_q, C_in_per_q_grp, kH, kW]
-    torch::Tensor weight_j,     // [C_out_per_q, C_in_per_q_grp, kH, kW]
-    torch::Tensor weight_k,     // [C_out_per_q, C_in_per_q_grp, kH, kW]
-    torch::Tensor bias_r,       // [C_out_per_q] or None
-    torch::Tensor bias_i,       // [C_out_per_q] or None
-    torch::Tensor bias_j,       // [C_out_per_q] or None
-    torch::Tensor bias_k,       // [C_out_per_q] or None
+    torch::Tensor input,        // [B, C_in, H_in, W_in, Q=4]
+    torch::Tensor weight_r,     // [C_out, C_in_grp, kH, kW]
+    torch::Tensor weight_i,     // [C_out, C_in_grp, kH, kW]
+    torch::Tensor weight_j,     // [C_out, C_in_grp, kH, kW]
+    torch::Tensor weight_k,     // [C_out, C_in_grp, kH, kW]
+    torch::Tensor bias_r,       // [C_out] or None
+    torch::Tensor bias_i,       // [C_out] or None
+    torch::Tensor bias_j,       // [C_out] or None
+    torch::Tensor bias_k,       // [C_out] or None
     std::vector<int64_t> stride,
     std::vector<int64_t> padding,
     std::vector<int64_t> dilation,
     int64_t groups) {
 
     TORCH_CHECK(input.dim() == 5, "qconv_forward_cuda expects 5D input");
-    TORCH_CHECK(input.size(2) == 4, "Input quaternion dimension (dim 2) must be 4");
+    TORCH_CHECK(input.size(4) == 4, "Input quaternion dimension (dim 4) must be 4");
     TORCH_CHECK(weight_r.dim() == 4, "weight_r must be 4D");
     TORCH_CHECK(weight_i.dim() == 4, "weight_i must be 4D");
     TORCH_CHECK(weight_j.dim() == 4, "weight_j must be 4D");
     TORCH_CHECK(weight_k.dim() == 4, "weight_k must be 4D");
 
     const auto B = input.size(0);
-    const auto C_in_per_q = input.size(1);
-    const auto H_in = input.size(3);
-    const auto W_in = input.size(4);
+    const auto C_in = input.size(1);
+    const auto H_in = input.size(2);
+    const auto W_in = input.size(3);
 
-    const auto C_out_per_q = weight_r.size(0);
-    const auto C_in_per_q_grp = weight_r.size(1);
+    const auto C_out = weight_r.size(0);
+    const auto C_in_grp = weight_r.size(1);
     const auto kH = weight_r.size(2);
     const auto kW = weight_r.size(3);
 
     // Basic shape consistency checks
-    TORCH_CHECK(C_in_per_q == C_in_per_q_grp * groups, "Input channels, group channels, and groups mismatch");
-    TORCH_CHECK(weight_i.sizes() == weight_r.sizes(), "weight_i shape mismatch");
-    TORCH_CHECK(weight_j.sizes() == weight_r.sizes(), "weight_j shape mismatch");
-    TORCH_CHECK(weight_k.sizes() == weight_r.sizes(), "weight_k shape mismatch");
+    TORCH_CHECK(C_in == C_in_grp * groups, "Input channels must equal C_in_grp * groups");
 
-    if (bias_r.defined()) {
-        TORCH_CHECK(bias_r.dim() == 1 && bias_r.size(0) == C_out_per_q, "bias_r shape mismatch");
-        // TORCH_CHECK(bias_i.defined() && bias_i.sizes() == bias_r.sizes(), "bias_i shape mismatch");
-        // TORCH_CHECK(bias_j.defined() && bias_j.sizes() == bias_r.sizes(), "bias_j shape mismatch");
-        // TORCH_CHECK(bias_k.defined() && bias_k.sizes() == bias_r.sizes(), "bias_k shape mismatch");
-    }
+    // Calculate output dimensions
+    const int H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) / stride[0] + 1;
+    const int W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) / stride[1] + 1;
 
+    // Create output tensor with BCHWQ layout
+    auto output = torch::empty({B, C_out, H_out, W_out, 4}, input.options());
 
-    const auto H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) / stride[0] + 1;
-    const auto W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) / stride[1] + 1;
+    const int threads = 256;
+    const int blocks = (B * C_out * H_out * W_out + threads - 1) / threads;
 
-    auto output = torch::empty({B, C_out_per_q, 4, H_out, W_out}, input.options());     // [B, C_out_per_q, Q=4, H_out, W_out]
-
-
-    const int threads = 256; // Adjust based on arch
-    const int total_output_quaternions = B * C_out_per_q * H_out * W_out;
-    const int blocks = (total_output_quaternions + threads - 1) / threads;
-
-    input = input.contiguous();
-    weight_r = weight_r.contiguous();
-    weight_i = weight_i.contiguous();
-    weight_j = weight_j.contiguous();
-    weight_k = weight_k.contiguous();
-    bias_r = bias_r.defined() ? bias_r.contiguous() : bias_r;
-    bias_i = bias_i.defined() ? bias_i.contiguous() : bias_i;
-    bias_j = bias_j.defined() ? bias_j.contiguous() : bias_j;
-    bias_k = bias_k.defined() ? bias_k.contiguous() : bias_k;
-
-
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "qconv_forward_cuda_hamilton", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "qconv_forward_cuda", ([&] {
         qconv_forward_kernel_hamilton<scalar_t><<<blocks, threads>>>(
             output.data_ptr<scalar_t>(),
             input.data_ptr<scalar_t>(),
@@ -682,10 +789,9 @@ torch::Tensor qconv_forward_cuda(
             bias_i.defined() ? bias_i.data_ptr<scalar_t>() : nullptr,
             bias_j.defined() ? bias_j.data_ptr<scalar_t>() : nullptr,
             bias_k.defined() ? bias_k.data_ptr<scalar_t>() : nullptr,
-            B, C_in_per_q, C_out_per_q, H_in, W_in, H_out, W_out,
+            B, C_in, C_out, H_in, W_in, H_out, W_out,
             kH, kW, stride[0], stride[1], padding[0], padding[1],
-            dilation[0], dilation[1], 
-            groups
+            dilation[0], dilation[1], groups
         );
     }));
 
