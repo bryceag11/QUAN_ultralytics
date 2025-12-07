@@ -31,10 +31,11 @@
 
 | Task | Dataset | Model | Performance |
 |------|---------|-------|-------------|
-| OBB Detection | DOTA-v1.0 | QUAN-YOLO11n | 78.X mAP50 |
-| OBB Detection | DOTA-v1.0 | QUAN-YOLO11s | 79.X mAP50 |
-| Classification | CIFAR-10 | Q-WRN-16-4 | 95.X% |
-| Classification | ImageNet | Q-ResNet-34 | 76.X% Top-1 |
+| OBB Detection | DOTA-v1.0 | QUAN-YOLO11n | 76.2/60.8 (mAP50/50-95) |
+| Detection | COCO2017 | QUAN-YOLO11n | 47.8/33.9 (mAP50/50-95) |
+| Classification | CIFAR-10 | Q-WRN-16-2 | 95.12% |
+| Classification | CIFAR-100 | Q-WRN-16-4 | 76.83% |
+| Classification | ImageNet | Q-ResNet-34 | 74.28% |
 
 ---
 
@@ -266,11 +267,14 @@ print(f"Output shape: {y.shape}")  # [1, 32, 32, 32, 4]
 If you use QUAN in your research, please cite:
 
 ```bibtex
-@inproceedings{quan2025,
-  title={QUAN: Rotation-Equivariant Object Detection via Separable Quaternion Neural Networks},
-  author={Your Name},
-  booktitle={IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
-  year={2025}
+@misc{grant2025quaternionapproximationnetworksenhanced,
+      title={Quaternion Approximation Networks for Enhanced Image Classification and Oriented Object Detection}, 
+      author={Bryce Grant and Peng Wang},
+      year={2025},
+      eprint={2509.05512},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2509.05512}, 
 }
 ```
 
