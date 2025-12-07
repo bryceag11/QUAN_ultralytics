@@ -6,7 +6,7 @@
 
 [![Paper](https://img.shields.io/badge/IROS%202025-Paper-blue)](https://arxiv.org/abs/2509.05512)
 [![Website](https://img.shields.io/badge/Website-QUANpaper-purple)](https://cwru-aism.github.io/QUANpaper/)
-[![Code](https://img.shields.io/badge/Code-GitHub-black)](https://github.com/CWRU-AISM/QUAN_ultralytics)
+[![Code](https://img.shields.io/badge/Code-GitHub-black)](https://github.com/bryceag11/QUAN_ultralytics.git)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-green.svg)](LICENSE)
 
 <img src="https://github.com/user-attachments/assets/8b4b083b-d657-43cf-8cf5-a2d6cdb8af46" width="600" alt="Poincaré Quaternion Mapping">
