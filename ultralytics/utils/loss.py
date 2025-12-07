@@ -851,13 +851,75 @@ class v8ClassificationLoss:
 
 
 class v8OBBLoss(v8DetectionLoss):
-    """Calculates losses for object detection, classification, and box distribution in rotated YOLO models."""
+    """Calculates losses for object detection, classification, and box distribution in rotated YOLO models.
+
+    Integrates quaternion angular loss from QUAN paper for better orientation prediction.
+    """
 
     def __init__(self, model):
         """Initializes v8OBBLoss with model, assigner, and rotated bbox loss; note model must be de-paralleled."""
         super().__init__(model)
         self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
+
+        # Quaternion angular loss hyperparameters from QUAN paper
+        self.use_quaternion_angle_loss = True
+        self.lambda_angular = 0.5  # Weight for quaternion angular loss
+        self.lambda_reg = 0.05     # Weight for quaternion regularization loss
+
+    def angle_to_quaternion(self, angles):
+        """Convert rotation angles to quaternions (rotation around z-axis for 2D OBB).
+
+        Args:
+            angles: Tensor of shape [..., 1] containing rotation angles in radians
+        Returns:
+            Quaternions of shape [..., 4] as [q_r, q_i, q_j, q_k]
+        """
+        half_angles = angles / 2
+        q_r = torch.cos(half_angles)
+        q_i = torch.zeros_like(half_angles)
+        q_j = torch.zeros_like(half_angles)
+        q_k = torch.sin(half_angles)
+        return torch.cat([q_r, q_i, q_j, q_k], dim=-1)
+
+    def quaternion_angular_loss(self, q_pred, q_target):
+        """Compute geodesic angular distance between predicted and target quaternions.
+
+        Uses the geodesic distance on SO(3) which properly handles the double cover
+        property of quaternions (q and -q represent the same rotation).
+
+        Args:
+            q_pred: Predicted quaternions [..., 4]
+            q_target: Target quaternions [..., 4]
+        Returns:
+            Scalar loss value
+        """
+        # Normalize quaternions
+        q_pred = F.normalize(q_pred, p=2, dim=-1)
+        q_target = F.normalize(q_target, p=2, dim=-1)
+
+        # Compute dot product
+        dot_product = (q_pred * q_target).sum(dim=-1)
+
+        # Clamp to avoid numerical issues with arccos
+        dot_product = torch.clamp(dot_product, -1.0 + 1e-7, 1.0 - 1e-7)
+
+        # Account for double cover: use absolute value
+        # The angle between q and -q represents the same rotation
+        angular_distance = 2.0 * torch.arccos(torch.abs(dot_product))
+
+        return angular_distance
+
+    def quaternion_regularization_loss(self, q_pred):
+        """Enforce unit quaternion constraint ||q||² = 1.
+
+        Args:
+            q_pred: Predicted quaternions [..., 4]
+        Returns:
+            Scalar regularization loss
+        """
+        norm_squared = (q_pred ** 2).sum(dim=-1)
+        return ((norm_squared - 1.0) ** 2).mean()
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocesses the target counts and matches with the input batch size to output a tensor."""
@@ -877,8 +939,8 @@ class v8OBBLoss(v8DetectionLoss):
         return out
 
     def __call__(self, preds, batch):
-        """Calculate and return the loss for the YOLO model."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        """Calculate and return the loss for the YOLO model with quaternion angular loss."""
+        loss = torch.zeros(4, device=self.device)  # box, cls, dfl, quaternion_angle
         feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
         batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -939,14 +1001,36 @@ class v8OBBLoss(v8DetectionLoss):
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
+
+            # Quaternion angular loss for orientation (QUAN paper)
+            if self.use_quaternion_angle_loss:
+                # Extract predicted and target angles for foreground samples
+                # pred_bboxes has shape [B, N, 5] where last dim is angle
+                # target_bboxes has shape [B, N, 5] where last dim is angle
+                pred_angles_fg = pred_bboxes[fg_mask][..., 4:5]  # [num_fg, 1]
+                target_angles_fg = target_bboxes[fg_mask][..., 4:5]  # [num_fg, 1]
+
+                # Convert angles to quaternions
+                q_pred = self.angle_to_quaternion(pred_angles_fg)  # [num_fg, 4]
+                q_target = self.angle_to_quaternion(target_angles_fg)  # [num_fg, 4]
+
+                # Compute weighted quaternion angular loss
+                weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)  # [num_fg, 1]
+                angular_loss = self.quaternion_angular_loss(q_pred, q_target)  # [num_fg]
+                loss[3] = (angular_loss.unsqueeze(-1) * weight).sum() / target_scores_sum
+
+                # Optional: add quaternion regularization loss
+                reg_loss = self.quaternion_regularization_loss(q_pred)
+                loss[3] += self.lambda_reg * reg_loss
         else:
             loss[0] += (pred_angle * 0).sum()
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+        loss[3] *= self.lambda_angular  # quaternion angular gain
 
-        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl, quat_angle)
 
     def bbox_decode(self, anchor_points, pred_dist, pred_angle):
         """

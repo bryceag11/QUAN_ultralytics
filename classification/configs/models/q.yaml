@@ -1,0 +1,61 @@
+# q.yaml
+# Regular Detection - Quaternion Pipeline Configuration
+# ================================================
+
+nc: 80  # Number of classes
+scales:
+  n: [0.50, 0.25, 1024]  # nano
+  s: [0.50, 0.50, 1024]  # small
+  m: [0.50, 1.00, 512]   # medium 
+  l: [1.00, 1.00, 512]   # large
+  x: [1.00, 1.50, 512]   # xlarge
+
+backbone:
+  # Input: [B, 4, H, W] from RGBtoQuatTransform
+  - [-1, 1, QConv2D, {'in_channels': 3, 'out_channels': 32, 'kernel_size': 3, 'stride': 2}]     # P1/2: [B, 32/2, 4, H/2, W/2]
+  - [0, 1, QConv2D, {'in_channels': 32, 'out_channels': 64, 'kernel_size': 3, 'stride': 2}]    # P2/4: [B, 64/2, 4, H/4, W/4]
+  - [1, 1, C3k2, {'in_channels': 64, 'out_channels': 128, 'c3k': False, 'e': 1}]           # [B, 128, 4, H/4, W/4]
+  - [2, 1, C3k2, {'in_channels': 128, 'out_channels': 128, 'c3k': False, 'e': 1}]          # [B, 128, 4, H/4, W/4]
+
+  - [3, 1, QConv2D, {'in_channels': 128, 'out_channels': 64, 'kernel_size': 3, 'stride': 2}]  # P3/8: [B, 64, 4, H/8, W/8]
+  - [4, 1, C3k2, {'in_channels': 64, 'out_channels': 256, 'c3k': False, 'e': 1}]          # [B, 256, 4, H/8, W/8]
+  - [5, 1, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': False, 'e': 1}]          # [B, 256, 4, H/8, W/8]
+
+  - [6, 1, QConv2D, {'in_channels': 256, 'out_channels': 256, 'kernel_size': 3, 'stride': 2}]  # P4/16: [B, 256, 4, H/16, W/16]
+  - [7, 1, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': True, 'e': 1.0}]           # [B, 256, 4, H/16, W/16]
+  - [8, 1, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': True, 'e': 1.0}]           # [B, 256, 4, H/16, W/16]
+
+  - [9, 1, QConv2D, {'in_channels': 256, 'out_channels': 512, 'kernel_size': 3, 'stride': 2}]  # P5/32: [B, 512, 4, H/32, W/32]
+  - [10, 1, C3k2, {'in_channels': 512, 'out_channels': 512, 'c3k': True, 'e': 1.0}]          # [B, 512, 4, H/32, W/32]
+  - [11, 1, C3k2, {'in_channels': 512, 'out_channels': 512, 'c3k': True, 'e': 1.0}]          # [B, 512, 4, H/32, W/32]
+  - [12, 1, SPPF, {'in_channels': 512, 'out_channels': 512, 'kernel_size': 5}]                # [B, 512, 4, H/32, W/32]
+
+head:
+  # Upsampling path
+  - [13, 1, QuaternionUpsample, {'scale_factor': 2, 'mode': 'nearest'}]                          # [B, 512, 4, 28, 38]
+  
+  # Concatenate layer 13 with layer 4
+  - [[13, 4], 1, QuaternionConcat, {'dim': 1, 'reduce': True, 'target_channels': 256}]       # [B, 256, 4, H/16, W/16]
+  - [14, 1, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': False}]                   # [B, 256, 4, H/16, W/16]
+  
+  - [15, 1, QuaternionUpsample, {'scale_factor': 2, 'mode': 'nearest'}]                               # [B, 256, 4, H/8, W/8]
+  
+  # Concatenate layer 15 with layer 9
+  - [[15, 9], 1, QuaternionConcat, {'dim': 1, 'reduce': True, 'target_channels': 128}]       # [B, 128, 4, H/8, W/8]
+  - [16, 1, C3k2, {'in_channels': 128, 'out_channels': 128, 'c3k': False}]                   # [B, 128, 4, H/8, W/8]
+  
+  # Detection heads
+  - [17, 1, QConv2D, {'in_channels': 128, 'out_channels': 128, 'kernel_size': 3, 'stride': 2}] # [B, 128, 4, H/16, W/16]
+  
+  # Concatenate layer 17 with layer 14
+  - [[17, 14], 1, QuaternionConcat, {'dim': 1, 'reduce': True, 'target_channels': 256}]      # [B, 256, 4, H/16, W/16]
+  - [18, 1, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': False}]                   # [B, 256, 4, H/16, W/16]
+  
+  - [19, 1, QConv2D, {'in_channels': 256, 'out_channels': 256, 'kernel_size': 3, 'stride': 2}] # [B, 256, 4, H/32, W/32]
+  
+  # Concatenate layer 19 with layer 14
+  - [[19, 14], 1, QuaternionConcat, {'dim': 1, 'reduce': True, 'target_channels': 512}]      # [B, 512, 4, H/32, W/32]
+  - [20, 1, C3k2, {'in_channels': 512, 'out_channels': 512, 'c3k': True, 'e': 1.0}]        # [B, 512, 4, H/32, W/32]
+
+  # Detection Head
+  - [[17, 19, 20], 1, QDetectHead, {'nc': 80, 'ch': [128, 256, 512]}]                       # Outputs: [cls, box]

@@ -24,22 +24,35 @@ OG Class
 '''
 
 class QER(nn.Module):
+    """Quaternion to Real Extraction module.
+
+    Efficiently converts quaternion features [B, C, H, W, 4] to real-valued
+    features [B, out_channels, H, W] via a 1x1 convolution that learns
+    the optimal mixing of quaternion components.
+
+    Note: in_channels should be the flattened quaternion channel count (C*4),
+    as the input tensor [B, C, H, W, 4] gets reshaped to [B, C*4, H, W].
+    """
     def __init__(self, in_channels, out_channels=None, kernel_size=None):
         super().__init__()
-        self.act = nn.SiLU()
-        self.bn = nn.BatchNorm2d(out_channels)
         self.output_proj = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size)
         self.bias = self.output_proj.bias
+
     def forward(self, x):
         B, C, H, W, Q = x.shape
-        x = x.permute(0, 1, 4, 2, 3).reshape(B, C*4, H, W)
+        # Optimized reshape: permute puts Q before spatial dims for better memory locality
+        # then reshape flattens C*Q into channel dimension
+        # Using contiguous() ensures good memory access patterns for conv
+        x = x.permute(0, 1, 4, 2, 3).contiguous().view(B, C * Q, H, W)
         return self.output_proj(x)
 
 
 class QERPreserve(nn.Module):
-    """
-    Better quaternion extraction that preserves more information.
-    Instead of just taking real part, use all components.
+    """Quaternion extraction with learnable mixing.
+
+    Better quaternion extraction that preserves more information by learning
+    the optimal mixing of all quaternion components rather than just taking
+    the real part.
     """
     def __init__(self, c1, c2, k=1):
         super().__init__()
@@ -48,24 +61,23 @@ class QERPreserve(nn.Module):
         assert c1 % 4 == 0
         self.c1 = c1
         self.c2 = c2
-        
+
         # Learnable mixing matrix for quaternion components
-        # This is more flexible than just extracting real
         self.mix = nn.Conv2d(c1, c2, k, bias=True)
         self.bias = self.mix.bias
+
         # Initialize to preserve information
         with torch.no_grad():
-            # Start with identity-like mapping
             nn.init.xavier_normal_(self.mix.weight)
             nn.init.zeros_(self.mix.bias)
-    
+
     def forward(self, x):
         # x: [B, C, H, W, 4] quaternion
         B, C, H, W, Q = x.shape
-        
-        # Flatten quaternion to channels
-        x = x.permute(0, 1, 4, 2, 3).reshape(B, C*4, H, W)
-        
+
+        # Optimized: flatten quaternion to channels with contiguous memory
+        x = x.permute(0, 1, 4, 2, 3).contiguous().view(B, C * Q, H, W)
+
         # Apply learnable mixing
         return self.mix(x)
 
@@ -287,22 +299,20 @@ class HybridDetect(Detect):
         c2 = max((ch[0] // 4, self.reg_max * 4))
         c3 = max(ch[0], min(self.nc, 100))
         
-        # Override cv2 and cv3 to handle quaternion->real conversion better
+        # Override cv2 and cv3 to handle quaternion->real conversion
         for i in range(self.nl):
-            # Box regression path
             x = ch[i]
+            # Box regression path
             self.cv2[i] = nn.Sequential(
-                Conv(x, c2, 3),  # Quaternion conv
-                Conv(c2, c2, 3),  # Quaternion conv  
-                QER(c2//4, c2, 1),  # Extract real: [B,C,H,W,4] -> [B,C*4,H,W]
-                nn.Conv2d(c2, 4 * self.reg_max, 1)  # Regular conv on expanded features
+                Conv(x, c2, 3),   # Quaternion conv
+                Conv(c2, c2, 3),  # Quaternion conv
+                QER(c2, 4 * self.reg_max, 1),  # Extract real: in_channels=c2 (flattened)
             )
-            
-            # Classification path with skip connection
+
+            # Classification path
             self.cv3[i] = nn.Sequential(
-                Conv(x, c3, 3),  # Quaternion conv
-                QER(c3//4, c3, 1),  # Extract real
-                nn.Conv2d(c3, self.nc, 1)  # Regular conv
+                Conv(x, c3, 3),   # Quaternion conv
+                QER(c3, self.nc, 1),  # Extract real: in_channels=c3 (flattened)
             )
             
     def forward(self, x):
@@ -320,12 +330,10 @@ class OBB(Detect):
         c4 = max(ch[0] // 4, self.ne)
         self.cv4 = nn.ModuleList(
             nn.Sequential(
-
                 Conv(x, c4, 3),
                 Conv(c4, c4, 3),
-                QER(c4//4, c4, 1),  # Extract real component and scale back
-                nn.Conv2d(c4, self.ne, 1)
-                ) for x in ch)
+                QER(c4, self.ne, 1),  # Extract real: in_channels=c4 (flattened from quaternion)
+            ) for x in ch)
 
     def forward(self, x):
         """Concatenates and returns predicted bounding boxes and class probabilities."""

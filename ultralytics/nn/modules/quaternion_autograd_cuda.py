@@ -1,12 +1,18 @@
 # quaternion_autograd_cuda.py - Updated autograd function
 import torch
 from torch.autograd import Function
+import sys
+import os
 
 try:
+    # Add cuda directory to path for quaternion_ops import
+    cuda_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cuda')
+    if cuda_dir not in sys.path:
+        sys.path.insert(0, cuda_dir)
     import quaternion_ops
     CUDA_EXT = True
-except ImportError:
-    print("Failed to import quaternion_ops CUDA extension")
+except ImportError as e:
+    print(f"Failed to import quaternion_ops CUDA extension: {e}")
     CUDA_EXT = False
 
 class QConvFunction(Function):

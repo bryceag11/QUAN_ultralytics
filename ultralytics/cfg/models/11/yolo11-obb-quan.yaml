@@ -1,0 +1,51 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# QUAN-YOLO11-OBB: Quaternion Approximation Networks for Oriented Bounding Box Detection
+# Uses quaternion convolutions for rotation-equivariant oriented object detection
+# Paper: "QUAN: Rotation-Equivariant Object Detection via Separable Quaternion Neural Networks"
+# Includes quaternion angular loss for improved orientation prediction
+
+# Parameters
+nc: 80 # number of classes
+scales: # model compound scaling constants
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024] # QUAN-YOLO11n-OBB
+  s: [0.50, 0.50, 1024] # QUAN-YOLO11s-OBB
+  m: [0.50, 1.00, 512]  # QUAN-YOLO11m-OBB
+  l: [1.00, 1.00, 512]  # QUAN-YOLO11l-OBB
+  x: [1.00, 1.50, 512]  # QUAN-YOLO11x-OBB
+
+# QUAN-YOLO11 backbone with quaternion modules
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]      # 0-P1/2  (uses QConv2D internally)
+  - [-1, 1, Conv, [128, 3, 2]]     # 1-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]]
+  - [-1, 1, Conv, [256, 3, 2]]     # 3-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]]     # 5-P4/16
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]]    # 7-P5/32
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, QSPPF, [1024, 5]]      # 9 - Quaternion Spatial Pyramid Pooling
+  - [-1, 2, QC2PSA, [1024]]        # 10 - Quaternion C2 with Position-Sensitive Attention
+
+# QUAN-YOLO11 head with quaternion upsampling
+head:
+  - [-1, 1, QUpsample, [2, "nearest"]]  # 11 - Quaternion-aware upsampling
+  - [[-1, 6], 1, Concat, [1]]           # 12 - cat backbone P4
+  - [-1, 2, C3k2, [512, False]]         # 13
+
+  - [-1, 1, QUpsample, [2, "nearest"]]  # 14
+  - [[-1, 4], 1, Concat, [1]]           # 15 - cat backbone P3
+  - [-1, 2, C3k2, [256, False]]         # 16 (P3/8-small)
+
+  - [-1, 1, Conv, [256, 3, 2]]          # 17
+  - [[-1, 13], 1, Concat, [1]]          # 18 - cat head P4
+  - [-1, 2, C3k2, [512, False]]         # 19 (P4/16-medium)
+
+  - [-1, 1, Conv, [512, 3, 2]]          # 20
+  - [[-1, 10], 1, Concat, [1]]          # 21 - cat head P5
+  - [-1, 2, C3k2, [1024, True]]         # 22 (P5/32-large)
+
+  - [[16, 19, 22], 1, OBB, [nc, 1]]     # 23 - OBB head with QER extraction + quaternion angular loss
